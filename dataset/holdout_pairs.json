@@ -1,0 +1,15 @@
+{
+  "_README": "10-pair holdout set per design-decisions.md §7. Different triggers AND different merchants from test_pairs.json. Used ONCE post-prompt-lockdown to detect overfitting. If holdout-avg < 0.9 × 30-pair-avg → prompts overfit; revisit. 8 merchant + 2 customer (proportional to 25/5 in submission set).",
+  "pairs": [
+    { "test_id": "H01", "merchant_id": "m_017_dr_rajan_dentist_mumbai",     "trigger_id": "trg_039_perf_spike_m_017_dr_rajan_denti",      "customer_id": null },
+    { "test_id": "H02", "merchant_id": "m_017_dr_rajan_dentist_mumbai",     "trigger_id": "trg_059_competitor_opened_m_017_dr_rajan_denti", "customer_id": null },
+    { "test_id": "H03", "merchant_id": "m_023_sushma_salon_pune",           "trigger_id": "trg_037_perf_spike_m_023_sushma_salon_p",      "customer_id": null },
+    { "test_id": "H04", "merchant_id": "m_026_karim_salon_ahmedabad",       "trigger_id": "trg_043_milestone_reached_m_026_karim_salon_ah", "customer_id": null },
+    { "test_id": "H05", "merchant_id": "m_029_anand_restaurant_chandigarh", "trigger_id": "trg_046_dormant_with_vera_m_029_anand_restaura", "customer_id": null },
+    { "test_id": "H06", "merchant_id": "m_033_anand_restaurant_bangalore",  "trigger_id": "trg_092_renewal_due_m_033_anand_restaura",     "customer_id": null },
+    { "test_id": "H07", "merchant_id": "m_038_pooja_gym_chandigarh",        "trigger_id": "trg_086_trial_followup_m_038_pooja_gym_chan",  "customer_id": "c_149_myra_for_m_038_pooja_gym_chandigarh" },
+    { "test_id": "H08", "merchant_id": "m_039_karan_gym_jaipur",            "trigger_id": "trg_098_curious_ask_due_m_039_karan_gym_jaip", "customer_id": null },
+    { "test_id": "H09", "merchant_id": "m_044_vinod_pharmacie_chennai",     "trigger_id": "trg_057_competitor_opened_m_044_vinod_pharmaci", "customer_id": null },
+    { "test_id": "H10", "merchant_id": "m_045_vinod_pharmacie_mumbai",      "trigger_id": "trg_070_recall_due_m_045_vinod_pharmaci",      "customer_id": "c_180_diya_for_m_045_vinod_pharmacie_mumbai" }
+  ]
+}

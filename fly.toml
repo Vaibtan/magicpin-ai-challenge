@@ -1,0 +1,44 @@
+# fly.io deployment config — backup deploy target.
+# Usage:
+#   fly launch --no-deploy        # first time, accept defaults
+#   fly secrets set ANTHROPIC_API_KEY=sk-ant-... OPENAI_API_KEY=sk-...
+#   fly deploy
+# See challenge-testing-brief.md §6.
+
+app = "vera-bot"
+primary_region = "bom"          # Mumbai — closest to magicpin's audience
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  BOT_DEV_MODE = "0"
+  TEAM_NAME = "Vera Bot — magicpin AI Challenge"
+  TEAM_MEMBERS = "Vaibhav"
+  CONTACT_EMAIL = "vaibhav21296@iiitd.ac.in"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"   # stop idle machines (free-tier friendly)
+  auto_start_machines = true
+  min_machines_running = 1      # keep at least one warm during the judge window
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 25
+    hard_limit = 50
+
+  # Healthz check — judge polls every 60s; 3 consecutive failures DQ us
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "get"
+    path = "/v1/healthz"
+    protocol = "http"
+    timeout = "5s"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "512mb"              # plenty for in-memory stores at challenge scale

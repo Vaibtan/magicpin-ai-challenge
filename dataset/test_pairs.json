@@ -1,0 +1,39 @@
+{
+  "_README": "30 canonical (merchant, trigger) pairs for submission.jsonl. Hand-picked per design-decisions.md §7 to cover 5 categories × 6 trigger kinds, with exactly 5 customer-scope pairs (T03, T09, T15, T21, T27) matching the judge's expected distribution. Seed triggers preferred (richer payloads); generated triggers as filler.",
+  "pairs": [
+    { "test_id": "T01", "merchant_id": "m_001_drmeera_dentist_delhi",                "trigger_id": "trg_001_research_digest_dentists",                                "customer_id": null },
+    { "test_id": "T02", "merchant_id": "m_002_bharat_dentist_mumbai",                 "trigger_id": "trg_004_perf_dip_bharat",                                         "customer_id": null },
+    { "test_id": "T03", "merchant_id": "m_001_drmeera_dentist_delhi",                "trigger_id": "trg_003_recall_due_priya",                                        "customer_id": "c_001_priya_for_m001" },
+    { "test_id": "T04", "merchant_id": "m_002_bharat_dentist_mumbai",                 "trigger_id": "trg_005_renewal_due_bharat",                                      "customer_id": null },
+    { "test_id": "T05", "merchant_id": "m_001_drmeera_dentist_delhi",                "trigger_id": "trg_002_compliance_dci_radiograph",                               "customer_id": null },
+    { "test_id": "T06", "merchant_id": "m_001_drmeera_dentist_delhi",                "trigger_id": "trg_023_competitor_opened_dentist",                               "customer_id": null },
+
+    { "test_id": "T07", "merchant_id": "m_019_karim_salon_lucknow",                  "trigger_id": "trg_028_research_digest_m_019_karim_salon_lu",                    "customer_id": null },
+    { "test_id": "T08", "merchant_id": "m_023_sushma_salon_pune",                    "trigger_id": "trg_031_perf_dip_m_023_sushma_salon_p",                           "customer_id": null },
+    { "test_id": "T09", "merchant_id": "m_004_glamour_salon_pune",                   "trigger_id": "trg_067_recall_due_m_004_glamour_salon_",                         "customer_id": "c_026_saanvi_for_m_004_glamour_salon_pune" },
+    { "test_id": "T10", "merchant_id": "m_003_studio11_salon_hyderabad",             "trigger_id": "trg_006_festival_diwali",                                         "customer_id": null },
+    { "test_id": "T11", "merchant_id": "m_021_paras_salon_chandigarh",               "trigger_id": "trg_094_renewal_due_m_021_paras_salon_ch",                        "customer_id": null },
+    { "test_id": "T12", "merchant_id": "m_020_renu_salon_lucknow",                   "trigger_id": "trg_051_review_theme_emerged_m_020_renu_salon_luc",               "customer_id": null },
+
+    { "test_id": "T13", "merchant_id": "m_006_southindiancafe_restaurant_bangalore", "trigger_id": "trg_013_corporate_thali_planning",                                "customer_id": null },
+    { "test_id": "T14", "merchant_id": "m_028_karim_restaurant_chennai",             "trigger_id": "trg_038_perf_spike_m_028_karim_restaura",                         "customer_id": null },
+    { "test_id": "T15", "merchant_id": "m_006_southindiancafe_restaurant_bangalore", "trigger_id": "trg_078_appointment_tomorrow_m_006_southindiancaf",               "customer_id": "c_008_dipti_for_m006" },
+    { "test_id": "T16", "merchant_id": "m_005_pizzajunction_restaurant_delhi",       "trigger_id": "trg_011_review_theme_late_delivery",                              "customer_id": null },
+    { "test_id": "T17", "merchant_id": "m_005_pizzajunction_restaurant_delhi",       "trigger_id": "trg_010_ipl_match_delhi",                                         "customer_id": null },
+    { "test_id": "T18", "merchant_id": "m_006_southindiancafe_restaurant_bangalore", "trigger_id": "trg_012_milestone_mylari",                                        "customer_id": null },
+
+    { "test_id": "T19", "merchant_id": "m_037_pooja_gym_bangalore",                  "trigger_id": "trg_027_research_digest_m_037_pooja_gym_bang",                    "customer_id": null },
+    { "test_id": "T20", "merchant_id": "m_041_akash_gym_hyderabad",                  "trigger_id": "trg_035_perf_dip_m_041_akash_gym_hyde",                           "customer_id": null },
+    { "test_id": "T21", "merchant_id": "m_007_powerhouse_gym_bangalore",             "trigger_id": "trg_015_winback_rashmi",                                          "customer_id": "c_010_rashmi_for_m007" },
+    { "test_id": "T22", "merchant_id": "m_008_zenyoga_gym_chennai",                  "trigger_id": "trg_024_perf_spike_zen",                                          "customer_id": null },
+    { "test_id": "T23", "merchant_id": "m_037_pooja_gym_bangalore",                  "trigger_id": "trg_061_festival_upcoming_m_037_pooja_gym_bang",                  "customer_id": null },
+    { "test_id": "T24", "merchant_id": "m_039_karan_gym_jaipur",                     "trigger_id": "trg_095_renewal_due_m_039_karan_gym_jaip",                        "customer_id": null },
+
+    { "test_id": "T25", "merchant_id": "m_050_bharti_pharmacie_chennai",             "trigger_id": "trg_029_research_digest_m_050_bharti_pharmac",                    "customer_id": null },
+    { "test_id": "T26", "merchant_id": "m_047_anil_pharmacie_chandigarh",            "trigger_id": "trg_034_perf_dip_m_047_anil_pharmacie",                           "customer_id": null },
+    { "test_id": "T27", "merchant_id": "m_009_apollo_pharmacy_jaipur",               "trigger_id": "trg_019_chronic_refill_grandfather",                              "customer_id": "c_013_grandfather_for_m009" },
+    { "test_id": "T28", "merchant_id": "m_010_sunrisepharm_pharmacy_lucknow",        "trigger_id": "trg_064_festival_upcoming_m_010_sunrisepharm_p",                  "customer_id": null },
+    { "test_id": "T29", "merchant_id": "m_009_apollo_pharmacy_jaipur",               "trigger_id": "trg_018_supply_atorvastatin_recall",                              "customer_id": null },
+    { "test_id": "T30", "merchant_id": "m_048_vinod_pharmacie_mumbai",               "trigger_id": "trg_091_renewal_due_m_048_vinod_pharmaci",                        "customer_id": null }
+  ]
+}
