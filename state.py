@@ -4,13 +4,16 @@ Stores
 ------
 ContextStore       — (scope, context_id) -> {version, payload, delivered_at}
 ConversationStore  — conversation_id -> ConversationState (phase machine)
-SuppressionStore   — sent_keys, last_send_ts, daily_send_count
+SuppressionStore   — sent_keys, in-flight reservations, last_send_ts,
+                     daily_send_count
 
 Concurrency
 -----------
 Writes go through a per-store asyncio.Lock. Reads are lock-free (CPython
 dict-get is atomic). The judge load is ~1 req/sec, so contention is
 negligible; the locks exist to serialize writes against snapshots.
+Conversation reads return isolated copies; suppression reservations are used
+to block duplicate sends while compose calls are in flight.
 
 Persistence
 -----------
@@ -22,12 +25,12 @@ per spec (testing brief §11).
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import copy
 import json
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
@@ -37,6 +40,10 @@ STATE_DUMP_FILE = ROOT / "state_dump.json"
 
 # Valid context scopes per challenge-testing-brief.md §3
 _VALID_SCOPES: frozenset[str] = frozenset({"category", "merchant", "customer", "trigger"})
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 # ---- conversation phases (design-decisions.md §4) --------------------------
@@ -73,7 +80,7 @@ class ConversationState:
             "phase": self.phase.value,
             "auto_reply_count": self.auto_reply_count,
             "last_send_ts": self.last_send_ts,
-            "turns": list(self.turns),
+            "turns": copy.deepcopy(self.turns),
             "prior_bot_hashes": sorted(self.prior_bot_hashes),
         }
 
@@ -88,7 +95,7 @@ class ConversationState:
             phase=ConvPhase(d.get("phase", "INITIATED")),
             auto_reply_count=int(d.get("auto_reply_count", 0)),
             last_send_ts=float(d.get("last_send_ts", 0.0)),
-            turns=list(d.get("turns", [])),
+            turns=copy.deepcopy(d.get("turns", [])),
             prior_bot_hashes=set(d.get("prior_bot_hashes", [])),
         )
 
@@ -127,11 +134,15 @@ class ContextStore:
             cur = self._data.get(key)
             if cur is not None and cur["version"] > version:
                 return False, cur["version"], None
-            # Same or higher version → accept
+            if cur is not None and cur["version"] == version:
+                # Idempotent no-op: exact version already accepted. Do not
+                # replace payload with a divergent retry body.
+                return True, None, None
+            # Higher version → accept and atomically replace.
             self._data[key] = {
                 "version": version,
                 "payload": payload,
-                "delivered_at": delivered_at or datetime.now(timezone.utc).isoformat() + "Z",
+                "delivered_at": delivered_at or _utc_now_iso(),
             }
         return True, None, None
 
@@ -183,18 +194,23 @@ class ConversationStore:
 
     async def upsert(self, state: ConversationState) -> None:
         async with self._lock:
-            self._data[state.conversation_id] = state
+            self._data[state.conversation_id] = ConversationState.from_dict(state.to_dict())
 
     def get(self, conversation_id: str) -> ConversationState | None:
-        return self._data.get(conversation_id)
+        state = self._data.get(conversation_id)
+        return ConversationState.from_dict(state.to_dict()) if state is not None else None
 
     def open_conversations_for_merchant(self, merchant_id: str) -> list[ConversationState]:
         """Return conversations for this merchant in non-terminal phases."""
         open_phases = {ConvPhase.INITIATED, ConvPhase.AWAITING_REPLY, ConvPhase.ENGAGED, ConvPhase.AUTO_REPLY_SUSPECTED}
-        return [s for s in self._data.values() if s.merchant_id == merchant_id and s.phase in open_phases]
+        return [
+            ConversationState.from_dict(s.to_dict())
+            for s in self._data.values()
+            if s.merchant_id == merchant_id and s.phase in open_phases
+        ]
 
     def all(self) -> list[ConversationState]:
-        return list(self._data.values())
+        return [ConversationState.from_dict(s.to_dict()) for s in self._data.values()]
 
     def to_dict(self) -> dict[str, Any]:
         return {cid: s.to_dict() for cid, s in self._data.items()}
@@ -216,13 +232,41 @@ class SuppressionStore:
 
     def __init__(self) -> None:
         self.sent_keys: set[str] = set()
+        self.reserved_keys: set[str] = set()
+        self.reserved_merchants: set[str] = set()
         self.last_send_ts: dict[str, float] = {}
         self.daily_send_count: dict[tuple[str, str], int] = {}
         self._lock = asyncio.Lock()
 
-    async def record_emit(self, suppression_key: str, merchant_id: str, now: float) -> None:
+    async def reserve_for_compose(self, suppression_key: str, merchant_id: str) -> bool:
+        """Reserve a suppression key + merchant while compose is in flight.
+
+        This closes the race where two overlapping /v1/tick requests both pass
+        the gate filter before either one records the emitted action.
+        """
         async with self._lock:
-            self.sent_keys.add(suppression_key)
+            if suppression_key and (suppression_key in self.sent_keys or suppression_key in self.reserved_keys):
+                return False
+            if merchant_id in self.reserved_merchants:
+                return False
+            if suppression_key:
+                self.reserved_keys.add(suppression_key)
+            self.reserved_merchants.add(merchant_id)
+            return True
+
+    async def release_reservation(self, suppression_key: str, merchant_id: str) -> None:
+        async with self._lock:
+            if suppression_key:
+                self.reserved_keys.discard(suppression_key)
+            self.reserved_merchants.discard(merchant_id)
+
+    async def commit_emit(self, reserved_key: str, emitted_key: str, merchant_id: str, now: float) -> None:
+        async with self._lock:
+            for key in {reserved_key, emitted_key}:
+                if key:
+                    self.sent_keys.add(key)
+                    self.reserved_keys.discard(key)
+            self.reserved_merchants.discard(merchant_id)
             self.last_send_ts[merchant_id] = now
             ymd = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
             self.daily_send_count[(merchant_id, ymd)] = (
@@ -231,6 +275,12 @@ class SuppressionStore:
 
     def is_suppressed(self, suppression_key: str) -> bool:
         return suppression_key in self.sent_keys
+
+    def is_suppressed_or_reserved(self, suppression_key: str) -> bool:
+        return suppression_key in self.sent_keys or suppression_key in self.reserved_keys
+
+    def merchant_reserved(self, merchant_id: str) -> bool:
+        return merchant_id in self.reserved_merchants
 
     def cooldown_until(self, merchant_id: str, hours: int = 6) -> float:
         last = self.last_send_ts.get(merchant_id, 0.0)
@@ -261,6 +311,8 @@ class SuppressionStore:
 
     def clear(self) -> None:
         self.sent_keys.clear()
+        self.reserved_keys.clear()
+        self.reserved_merchants.clear()
         self.last_send_ts.clear()
         self.daily_send_count.clear()
 
@@ -275,7 +327,7 @@ def dump_state(contexts: ContextStore, conversations: ConversationStore,
         "contexts": contexts.to_dict(),
         "conversations": conversations.to_dict(),
         "suppression": suppression.to_dict(),
-        "dumped_at": datetime.now(timezone.utc).isoformat() + "Z",
+        "dumped_at": _utc_now_iso(),
     }
     with path.open("w", encoding="utf-8") as f:
         json.dump(blob, f, ensure_ascii=False, default=str)

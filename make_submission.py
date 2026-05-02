@@ -1,7 +1,7 @@
 """Standalone batch JSONL generator.
 
 Reads dataset/test_pairs.json or dataset/holdout_pairs.json, loads category +
-merchant + trigger + (customer) JSON for each pair, calls bot.compose(),
+merchant + trigger + (customer) JSON for each pair, calls bot.acompose(),
 writes one line per pair to submission.jsonl (or holdout_outputs.jsonl).
 
 Pairs are processed in category-sorted order so consecutive Anthropic calls
@@ -27,7 +27,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from bot import compose  # noqa: E402
+from bot import acompose  # noqa: E402
 from obs import log_event  # noqa: E402
 
 
@@ -85,7 +85,7 @@ def _category_sort(pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 async def _process_one(pair: dict[str, Any]) -> dict[str, Any]:
     category, merchant, trigger, customer = _resolve_pair_inputs(pair)
-    composed = await compose(category, merchant, trigger, customer, test_id=pair["test_id"])
+    composed = await acompose(category, merchant, trigger, customer, test_id=pair["test_id"])
     line = {"test_id": pair["test_id"], **composed.public()}
     return {"line": line, "composed": composed, "pair": pair}
 

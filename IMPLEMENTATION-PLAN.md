@@ -88,7 +88,7 @@
   - [x] `validator.validate(result, category, merchant, trigger, customer) -> list[ValidationError]` implements all 6 rules in design-decisions.md §8 *(10/10 unit tests pass via `scripts/test_validator.py`)*
   - [x] Validator failures emit `event=validator_fail` log: `{conversation_id, errors, retry_attempt}`
   - [x] `validator.fallback(trigger_kind, merchant, customer) -> ComposedMessage` returns a deterministic safe message keyed on trigger.kind. Fallback usage emits `event=fallback_used` log.
-  - [x] `bot.compose()` wires: build prompt → LLM call → parse → validate → if errors retry once with feedback → if still errors return fallback
+  - [x] `bot.acompose()` wires: build prompt → LLM call → parse → validate → if errors retry once with feedback → if still errors return fallback; `bot.compose()` is the synchronous challenge-contract wrapper returning public dict keys
   - [x] Every compose call emits exactly one `event=compose` JSONL log per design-decisions.md §10 (with all listed fields: ts, conv_id, merchant_id, trigger_id, model, prompt_version, skeleton, playbook, cache_hit, latency_ms, input_tokens, output_tokens, validation, anchor, lever, body_hash, rationale)
 
 ---
@@ -178,7 +178,7 @@
 - **What**: Add `CUSTOMER_FACING_SYSTEM` skeleton + customer-scope playbooks. Run the 5 customer-scope test pairs.
 - **Acceptance**:
   - [x] `prompts/skeletons.py` adds `CUSTOMER_FACING_SYSTEM` (merchant's voice → customer; legal taboos enforced; signed off as the merchant's clinic)
-  - [x] `bot.compose()` selects `CUSTOMER_FACING_SYSTEM` when `customer is not None`
+  - [x] `bot.acompose()` selects `CUSTOMER_FACING_SYSTEM` when `customer is not None`
   - [x] `PLAYBOOKS` has entries for customer-scope kinds: `recall_due, customer_lapsed_soft, customer_lapsed_hard, appointment_tomorrow, unplanned_slot_open` *(plus chronic_refill_due, trial_followup, wedding_package_followup)*
   - [ ] All 5 customer-scope test pairs (T03, T09, T15, T21, T27) compose without fallback *(PENDING — needs API keys)*
   - [ ] `send_as = "merchant_on_behalf"` for all 5 (validator check) *(PENDING; validator already enforces this)*
@@ -214,11 +214,12 @@
   - [x] After filtering, max 1 action per merchant per tick; max 3 actions total per tick
   - [x] Surviving triggers sorted by `(urgency desc, expires_at asc)` before truncation to top 3
   - [x] Composes are batched **sorted by `merchant.category_slug`** to maximize Anthropic prompt-cache hits
-  - [x] Composes run in parallel via `asyncio.gather` wrapped in `asyncio.wait_for(..., timeout=23.0)` — **hard ceiling 23s** to stay safely inside spec's 30s (and our internal 25s ceiling). On timeout: emit `event=tick_timeout` with `{completed_count, attempted_count}` and return empty actions list.
+  - [x] Selected actions are reserved by `(suppression_key, merchant_id)` before compose so overlapping ticks cannot duplicate sends while LLM calls are in flight.
+  - [x] Composes run in parallel via `asyncio.wait(..., timeout=23.0)` — **hard ceiling 23s** to stay safely inside spec's 30s (and our internal 25s ceiling). On timeout: cancel pending work, release its reservations, emit `event=tick_timeout` with `{completed_count, attempted_count}`, and return any completed valid actions.
   - [x] Composer self-veto: `body == ""` is dropped before action emission; logged as `event=composer_self_veto`
   - [x] On emit: `suppression_key` added to `sent_keys`, `last_send_ts` updated, `daily_send_count` incremented, conversation created in `INITIATED` phase. Phase transitions on emit logged as `event=phase_transition`.
   - [x] **Anchor/lever/prompt_version stripped** from each action dict before returning to caller (single helper `to_public_action(composed)` in `server.py`)
-  - [x] Test: push a duplicate-suppression-key trigger twice → second tick returns 0 actions for that trigger *(verified via gate-3 logic; FastAPI TestClient demonstrates state)*
+  - [x] Test: push a duplicate-suppression-key trigger twice → second tick returns 0 actions for that trigger; overlapping concurrent ticks for the same trigger emit exactly one action *(verified by `scripts/test_tick_reservations.py`)*
 
 ---
 
@@ -311,7 +312,7 @@
 - **Blocked by**: S18
 - **What**: Generate the final 30-line JSONL and run the holdout for overfit detection.
 - **Acceptance**:
-  - [ ] `python make_submission.py --all` writes 30 valid JSONL lines to `submission.jsonl`
+  - [x] `python make_submission.py --all` writes 30 valid JSONL lines to `submission.jsonl` *(current artifact generated through safe fallback path in no-key environment; regenerate with API keys before final judged submission)*
   - [ ] All 30 lines re-runnable from cache (`event=cache_hit` for all 30 on the second run)
   - [ ] `python make_submission.py --holdout --score` runs the 10-pair holdout through compose AND scores them via the same judge LLM as `judge_simulator`
   - [ ] Holdout average score ≥ 0.9 × 30-pair score → no overfit; lock prompts

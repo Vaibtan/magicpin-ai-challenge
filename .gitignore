@@ -1,11 +1,10 @@
 .cache/
 logs/
 state_dump.json
-submission.jsonl
 .env
 .env.local
 .python-version
-
+*/__pycache__/
 __pycache__/
 *.pyc
 *.pyo

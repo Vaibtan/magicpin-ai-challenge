@@ -1,8 +1,12 @@
-"""Smoke test for llm_client: one Sonnet compose call + one Haiku classify call.
+"""Smoke test for llm_client: one compose call + one classify call.
+
+Whichever provider chain is selected by env (LLM_PROVIDER / LLM_FALLBACK_PROVIDER)
+is what gets exercised. The flags below temporarily override that for one run.
 
 Usage:
-    python scripts/smoke_llm.py                 # both providers
-    python scripts/smoke_llm.py --openai-only   # force OpenAI fallback path
+    python scripts/smoke_llm.py                 # use whatever .env says
+    python scripts/smoke_llm.py --openai-only   # force OpenAI single-provider
+    python scripts/smoke_llm.py --gemini-only   # force Gemini single-provider
 """
 
 from __future__ import annotations
@@ -47,13 +51,23 @@ Merchant message: "Thank you for contacting us! Our team will respond shortly."
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--openai-only", action="store_true",
-                        help="Unset ANTHROPIC_API_KEY for this run to force fallback")
+                        help="Force LLM_PROVIDER=openai with no fallback for this run")
+    parser.add_argument("--gemini-only", action="store_true",
+                        help="Force LLM_PROVIDER=gemini with no fallback for this run")
     args = parser.parse_args()
 
+    if args.openai_only and args.gemini_only:
+        parser.error("--openai-only and --gemini-only are mutually exclusive")
     if args.openai_only:
-        os.environ.pop("ANTHROPIC_API_KEY", None)
+        os.environ["LLM_PROVIDER"] = "openai"
+        os.environ["LLM_FALLBACK_PROVIDER"] = "none"
+    if args.gemini_only:
+        os.environ["LLM_PROVIDER"] = "gemini"
+        os.environ["LLM_FALLBACK_PROVIDER"] = "none"
 
-    print("=== compose_call (Sonnet primary) ===")
+    primary = os.environ.get("LLM_PROVIDER", "anthropic")
+    fallback = os.environ.get("LLM_FALLBACK_PROVIDER", "openai")
+    print(f"=== compose_call (primary={primary}, fallback={fallback}) ===")
     result = await compose_call(
         SKELETON, CATEGORY_TEXT, DYNAMIC_TEXT,
         skeleton_id="smoke", category_id="smoke",
@@ -69,7 +83,7 @@ async def main() -> int:
     print(f"  json:        {json.dumps(result.json, ensure_ascii=False, indent=2)}")
 
     print()
-    print("=== classify_call (Haiku primary) ===")
+    print(f"=== classify_call (primary={primary}, fallback={fallback}) ===")
     classification = await classify_call(
         CLASSIFY_PROMPT,
         prompt_version="smoke_v1",

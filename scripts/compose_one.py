@@ -1,4 +1,4 @@
-"""Drive bot.compose() on a single canonical test pair and print the output.
+"""Drive bot.acompose() on a single canonical test pair and print the output.
 
 The S06 eyeball gate: hand-inspect output before scaling to all 14 playbooks.
 
@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from bot import compose  # noqa: E402
+from bot import acompose  # noqa: E402
 
 
 DATASET = ROOT / "dataset"
@@ -59,7 +59,7 @@ async def main() -> int:
     print(f"customer: {customer['identity']['name'] if customer else '(none)'}")
     print()
 
-    composed = await compose(category, merchant, trigger, customer, test_id=args.test_id)
+    composed = await acompose(category, merchant, trigger, customer, test_id=args.test_id)
 
     print("=== ComposedMessage (full, including private fields) ===")
     print(json.dumps({

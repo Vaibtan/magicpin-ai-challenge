@@ -56,6 +56,7 @@ elif PROVIDER == "openai":
     js.LLM_MODEL = os.getenv("JUDGE_LLM_MODEL", "gpt-4o") or js.LLM_MODEL
 elif PROVIDER == "gemini":
     js.LLM_API_KEY = os.getenv("GEMINI_API_KEY", "") or js.LLM_API_KEY
+    js.LLM_MODEL = os.getenv("JUDGE_LLM_MODEL", "gemini-2.5-pro") or js.LLM_MODEL
 elif PROVIDER == "deepseek":
     js.LLM_API_KEY = os.getenv("DEEPSEEK_API_KEY", "") or js.LLM_API_KEY
 elif PROVIDER == "groq":

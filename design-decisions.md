@@ -149,7 +149,8 @@ Per `available_trigger`:
 - Group by `merchant_id`; **max 1 action per merchant per tick** (FAQ-mandated).
 - Cap total at **3 actions per tick** (latency budget; 3 parallel Sonnet calls fit in 15s p95).
 - Sort by `(urgency desc, expires_at asc)`, take top 3.
-- **Compose in parallel** via `asyncio.gather`.
+- Reserve each selected `(suppression_key, merchant_id)` before composing so overlapping ticks cannot emit duplicate proactive sends while LLM calls are in flight.
+- **Compose in parallel** via `asyncio.wait` and preserve completed actions when only a subset times out.
 
 ### Composer self-veto
 
@@ -158,10 +159,10 @@ Per `available_trigger`:
 
 ### Hard timeout safety net
 
-- The parallel `asyncio.gather` over Sonnet calls is wrapped in `asyncio.wait_for(..., timeout=25.0)`.
-- 25s is a safety margin under the spec's 30s; protects against a single hung Sonnet call timing out the whole tick (judge penalty: -1 per timeout).
-- On timeout: return whatever finished + log `event=tick_timeout`. Never block past 25s.
-- `/v1/reply` gets the same wrapper — if classify+compose+validate exceeds 25s, return `action: "end"` with rationale `"timeout_safe_exit"` rather than blocking.
+- The parallel compose tasks are wrapped in an `asyncio.wait(..., timeout=23.0)` ceiling.
+- 23s is the safety margin under the spec's 30s and the simulator's actual 15s budget for `/v1/tick`. Two layers of buffer: per-call LLM ceiling at 10s (in `llm_client.LLM_CALL_TIMEOUT_S`) and the tick task wrapper at 23s. This leaves enough time for one provider fallback before the tick ceiling. Both env-overridable via `TICK_TIMEOUT_S` and `LLM_CALL_TIMEOUT_S`.
+- On timeout: cancel pending tasks, release their reservations, emit `event=tick_timeout` with `{completed_count, attempted_count}`, and return any completed valid actions. Never block past 23s.
+- `/v1/reply` gets the same wrapper — if classify+compose+validate exceeds 23s, return `action: "end"` with rationale `"timeout_safe_exit"` rather than blocking past spec.
 
 ### State updates on emit
 
@@ -169,6 +170,7 @@ Per `available_trigger`:
 - Update `last_send_ts[merchant_id] = now`
 - Increment `daily_send_count[merchant_id, date]`
 - Create new conversation in `INITIATED` phase at `conversation_id = "conv_{merchant_id}_{trigger_id}"`
+- If compose fails, self-vetoes, or is cancelled, release the in-flight reservation without consuming suppression/cooldown/daily-cap state.
 
 ### API response stripping
 
@@ -184,23 +186,49 @@ Before returning to the caller, every action dict (in `/v1/tick` `actions[]`) an
 
 - **In-memory dicts** for the live runtime.
 - **`state_dump.json` snapshot** on graceful shutdown; auto-loaded on startup **iff** `BOT_DEV_MODE=1`. Judge run never sets that env var → starts empty as spec requires.
-- Concurrency: single `asyncio.Lock` per store for writes; lock-free reads (CPython dict reads are atomic).
+- Concurrency: single `asyncio.Lock` per store for writes; lock-free reads (CPython dict reads are atomic). Conversation reads return isolated copies so caller-side mutation cannot leak back without an explicit `upsert()`.
+- `SuppressionStore` has an in-flight reservation set for selected proactive sends; reservations are committed only after an action is emitted and released on compose failure/timeout.
 
-### Module layout
+### Module layout (as built)
 
 ```
-bot.py             # Pure compose() + classify_reply() + handle_reply().
-                   # No HTTP, no globals, no I/O. Stateless functions.
-state.py           # ContextStore (idempotent push), ConversationStore, SuppressionStore.
-server.py          # FastAPI shell — 5 endpoints, ~150 lines glue.
-make_submission.py # Standalone batch JSONL generator. Reads dataset JSON directly.
-prompts/           # System prompts + playbook map. Versioned by file commit.
-                   # Every rationale records prompt_version for traceability.
-llm_client.py      # Anthropic + OpenAI fallback, cache breakpoints, response cache.
-validator.py       # 6-rule deterministic validator + fallback templates.
-classifiers.py     # Reply-classifier prefilters + Haiku fallback.
-logs/              # Runtime JSONL event logs.
-.cache/            # llm_responses.jsonl (gitignored).
+bot.py             # Pure sync compose() challenge contract + async acompose()
+                   # used by server/batch, plus classify_reply() + handle_reply().
+                   # No HTTP, no globals (beyond imports), no I/O.
+state.py           # ContextStore (idempotent push), ConversationStore (5-phase
+                   # enum), SuppressionStore. Async-locked writes; lock-free reads.
+server.py          # FastAPI shell — 5 spec endpoints + /v1/teardown stub.
+make_submission.py # Standalone batch JSONL generator. Reads dataset JSON
+                   # directly. Includes --score for holdout overfit check (S19).
+llm_client.py      # Anthropic + OpenAI fallback, 2-breakpoint prompt cache,
+                   # response cache (.cache/llm_responses.jsonl).
+validator.py       # 6-rule deterministic validator + fallback templates per kind.
+classifiers.py     # Reply-classifier: 6 regex pattern lists + Haiku fallback.
+obs.py             # Structured event logging — log_event(event, **fields) →
+                   # logs/run_{RUN_ID}.jsonl. Used by every other module.
+prompts/
+  __init__.py      # Exports PROMPT_VERSION (bump on any prompt edit to bust cache).
+  skeletons.py     # MERCHANT_FACING_SYSTEM + CUSTOMER_FACING_SYSTEM.
+  playbooks.py     # 31-entry per-trigger-kind PLAYBOOKS map +
+                   # ACTION_MODE_PLAYBOOK + QA_MODE_PLAYBOOK + ANCHOR_OPTIONAL_KINDS.
+  templates.py     # Templated reply messages for the no-LLM branches
+                   # (auto_reply probe/exit, hostile, not_interested, defer, unclear).
+                   # 16+ trigger-kind templates × 2 languages (en + hi-en).
+scripts/
+  smoke_llm.py             # Single Sonnet + Haiku live call (S03/S04 verify).
+  smoke_integration.py     # Full E2E via FastAPI TestClient (passes w/o keys).
+  compose_one.py           # Drive bot.acompose() on one test pair (S06 eyeball).
+  test_validator.py        # 10/10 deterministic validator unit tests.
+  test_classifiers.py      # 30/30 reply-classifier regex tests.
+  run_judge.py             # Wrapper over judge_simulator.py: loads .env, defaults
+                           # to Anthropic Sonnet, monkey-patches _warmup to push
+                           # all customers + merchants + triggers (closes the
+                           # simulator's customer-context gap).
+Dockerfile         # Production container — non-root user, healthcheck wired.
+.dockerignore      # Excludes .venv, .cache, logs, secrets.
+fly.toml           # Backup deploy: fly.io Mumbai region, always-warm machine.
+logs/              # Runtime JSONL event logs (gitignored).
+.cache/            # llm_responses.jsonl response cache (gitignored).
 ```
 
 ### `/v1/context` idempotency contract
@@ -419,10 +447,17 @@ Workflows powered by these logs:
 
 ### Self-grading
 
-- `judge_simulator.py` configured with Anthropic Sonnet for the LLM judge role.
+- `scripts/run_judge.py` is the wrapper around stock `judge_simulator.py`. It
+  loads `.env`, defaults to Anthropic Sonnet for the judge LLM role, and
+  monkey-patches `_warmup` to push **all** customers + merchants + triggers
+  (the stock harness only pushes 5 merchants and zero customers, which would
+  tank our 5 customer-scope test pairs). Always invoke via the wrapper, never
+  edit `judge_simulator.py` directly.
 - Run `_full` scenario after each major prompt change: scores all 30 pairs.
 - **Target**: ≥ 40/50 average on 30-pair set before submitting.
-- Holdout (10-pair) run **once** post-lockdown to verify no overfit.
+- Holdout (10-pair) run **once** post-lockdown to verify no overfit, scored
+  via `python make_submission.py --holdout --score` which reuses the same
+  `LLMScorer` from `judge_simulator.py`.
 
 ### Stopping rule
 
@@ -440,7 +475,7 @@ Workflows powered by these logs:
 | 1 | Bootstrap: pyproject deps (anthropic, openai, fastapi, uvicorn, pydantic, httpx), module skeleton, `.cache/`, `logs/`, `prompts/` | ~30m |
 | 2 | Dataset: run generator, commit expansion, author `test_pairs.json` (30) + `holdout_pairs.json` (10) | ~30m |
 | 3 | LLM client: Anthropic + OpenAI fallback, 2-breakpoint prompt cache, response cache, smoke test | ~45m |
-| 4 | Composer core: `bot.compose()` + merchant-facing skeleton + ONE playbook (`research_digest`) + validator + fallback. End-to-end on T01 (Dr. Meera). Eyeball before scaling | ~2h |
+| 4 | Composer core: `bot.acompose()` + synchronous `bot.compose()` wrapper + merchant-facing skeleton + ONE playbook (`research_digest`) + validator + fallback. End-to-end on T01 (Dr. Meera). Eyeball before scaling | ~2h |
 | 5 | Expand playbooks: ~14 trigger kinds + customer-facing skeleton; run all 30 pairs through compose, eyeball + initial self-grade | ~2h |
 | 6 | Reply handler: `classify_reply()` (regex + Haiku fallback), state machine, ACTION-MODE playbook, templated probes/exits, anti-repetition hash | ~1.5h |
 | 7 | Server endpoints: 5 endpoints, idempotency on `/v1/context` (200/409 semantics), 7-gate filter on `/v1/tick`, parallel compose, healthz + metadata | ~1h |

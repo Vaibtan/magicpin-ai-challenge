@@ -15,16 +15,16 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 
-load_dotenv()
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
 
-LOGS_DIR = Path(__file__).parent / "logs"
+LOGS_DIR = ROOT / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 RUN_ID = os.getenv("RUN_ID") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -34,7 +34,8 @@ _lock = threading.Lock()
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(time.time() * 1000) % 1000:03d}Z"
+    dt = datetime.now(timezone.utc)
+    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def log_event(event: str, **fields: Any) -> None:

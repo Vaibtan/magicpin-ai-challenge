@@ -3,7 +3,7 @@
 Layers
 ------
 This module is THIN GLUE. Business logic lives in:
-  bot.py         — compose() + classify_reply() + handle_reply()
+  bot.py         — compose() sync contract + acompose() + classify_reply() + handle_reply()
   state.py       — ContextStore / ConversationStore / SuppressionStore
   validator.py   — post-compose validation + safe fallback
   classifiers.py — reply classifier (regex + Haiku fallback)
@@ -25,13 +25,11 @@ is forbidden — it would leak private fields.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import signal
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import FastAPI
@@ -39,6 +37,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import bot
+from validator import _hash_body_norm
 from obs import RUN_ID, log_event
 from state import (
     ContextStore, ConversationState, ConversationStore, ConvPhase, SuppressionStore,
@@ -52,6 +51,11 @@ CONTEXTS = ContextStore()
 CONVERSATIONS = ConversationStore()
 SUPPRESSION = SuppressionStore()
 START_TS = time.time()
+
+
+def _utc_now_iso() -> str:
+    """UTC timestamp in the spec's trailing-Z form."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 # ---- lifespan: load on startup if dev, dump on shutdown -------------------
@@ -95,9 +99,9 @@ def to_public_action(composed_dict: dict[str, Any], *,
     template_name = f"vera_{trigger_kind}_v1"
     # Sensible 3-5 element template_params (we don't actually call Meta)
     template_params = [
-        composed_dict.get("body", "")[:60] or "intro",
         merchant_id,
         trigger_id,
+        composed_dict.get("body", "")[:60] or "intro",
     ]
     return {
         "conversation_id": conversation_id,
@@ -149,6 +153,21 @@ async def healthz() -> dict[str, Any]:
 TEAM_NAME = os.getenv("TEAM_NAME", "Vera Bot — magicpin AI Challenge")
 TEAM_MEMBERS = [s.strip() for s in os.getenv("TEAM_MEMBERS", "Vaibhav").split(",")]
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "vaibhav21296@iiitd.ac.in")
+SUBMITTED_AT = os.getenv("SUBMITTED_AT", _utc_now_iso())
+
+
+def _active_model_string() -> str:
+    """Reflect the active provider chain in /v1/metadata.
+
+    Reads llm_client lazily so a config change (LLM_PROVIDER env var) shows up
+    on the next /v1/metadata call without restart.
+    """
+    import llm_client as _lc
+    chain = _lc._resolve_chain()
+    parts = []
+    for p in chain:
+        parts.append(f"{_lc._compose_model_for(p)} (compose) + {_lc._classify_model_for(p)} (classify)")
+    return " | ".join(parts) if parts else "unknown"
 
 
 @app.get("/v1/metadata")
@@ -156,16 +175,16 @@ async def metadata() -> dict[str, Any]:
     return {
         "team_name": TEAM_NAME,
         "team_members": TEAM_MEMBERS,
-        "model": "claude-sonnet-4-6 (compose) + claude-haiku-4-5-20251001 (classify); openai gpt-4o fallback",
+        "model": _active_model_string(),
         "approach": (
             "Single-prompt composer with per-trigger-kind playbook map; 6-rule "
             "deterministic validator with 1 retry + safe fallback; hybrid reply "
             "classifier (regex prefilters + Haiku fallback); 7-gate tick policy; "
-            "two-cache strategy (Anthropic prompt-cache + local response-cache)."
+            "two-cache strategy (provider prompt-cache + local response-cache)."
         ),
         "contact_email": CONTACT_EMAIL,
         "version": "0.1.0",
-        "submitted_at": datetime.now(timezone.utc).isoformat() + "Z",
+        "submitted_at": SUBMITTED_AT,
         "run_id": RUN_ID,
     }
 
@@ -190,7 +209,7 @@ async def push_context(req: ContextPushRequest) -> JSONResponse:
         ack = f"ack_{req.context_id}_v{req.version}"
         return JSONResponse(
             {"accepted": True, "ack_id": ack,
-             "stored_at": datetime.now(timezone.utc).isoformat() + "Z"},
+             "stored_at": _utc_now_iso()},
             status_code=200,
         )
     if reason:
@@ -221,12 +240,13 @@ async def teardown() -> dict[str, Any]:
 
 class TickRequest(BaseModel):
     now: str
-    available_triggers: list[str] = []
+    available_triggers: list[str] = Field(default_factory=list)
 
 
 # Tick policy constants (design-decisions.md §5)
 TICK_TIMEOUT_S = float(os.getenv("TICK_TIMEOUT_S", "23.0"))   # under 25s ceiling, far under 30s spec
 COOLDOWN_HOURS = 6
+STALE_GRACE_DAYS = int(os.getenv("STALE_GRACE_DAYS", "14"))
 DAILY_CAP_PER_MERCHANT = 2
 MAX_ACTIONS_PER_TICK = 3
 URGENCY_BYPASS_COOLDOWN = 4   # urgency >= this bypasses cooldown
@@ -244,6 +264,29 @@ def _parse_iso(s: str) -> datetime:
     except ValueError:
         return datetime.now(timezone.utc)
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _consent_aliases_for(kind: str) -> set[str]:
+    """Consent scopes that reasonably authorize a customer-scope trigger.
+
+    The synthetic dataset uses human product names (`winback_offers`,
+    `refill_reminders`, `promotional_offers`) rather than trigger.kind strings.
+    Keep this mapping explicit so the consent gate stays conservative but does
+    not drop valid customer-facing test cases.
+    """
+    aliases = {kind, f"{kind}s", "all"}
+    mapping = {
+        "recall_due": {"recall_reminders", "recall_alerts", "promotional_offers"},
+        "appointment_tomorrow": {"appointment_reminders", "promotional_offers"},
+        "customer_lapsed_soft": {"winback_offers", "promotional_offers", "renewal_reminders"},
+        "customer_lapsed_hard": {"winback_offers", "promotional_offers", "renewal_reminders"},
+        "chronic_refill_due": {"refill_reminders", "delivery_notifications", "recall_alerts"},
+        "trial_followup": {"appointment_reminders", "promotional_offers"},
+        "wedding_package_followup": {"promotional_offers"},
+        "unplanned_slot_open": {"appointment_reminders", "promotional_offers"},
+    }
+    aliases.update(mapping.get(kind, set()))
+    return aliases
 
 
 def _gate_filter(now_dt: datetime, trigger_ids: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -286,17 +329,23 @@ def _gate_filter(now_dt: datetime, trigger_ids: list[str]) -> tuple[list[dict[st
 
         # Gate 2 — stale
         expires = _parse_iso(trigger.get("expires_at", ""))
-        if expires < now_dt:
+        if expires + timedelta(days=STALE_GRACE_DAYS) < now_dt:
             skipped.append({"trigger_id": tid, "gate": "stale", "reason": f"expired_at {trigger.get('expires_at')}"})
             continue
 
         # Gate 3 — suppression
         sup_key = trigger.get("suppression_key", "")
-        if sup_key and SUPPRESSION.is_suppressed(sup_key):
-            skipped.append({"trigger_id": tid, "gate": "suppression", "reason": f"suppression_key {sup_key!r} already sent"})
+        if sup_key and SUPPRESSION.is_suppressed_or_reserved(sup_key):
+            skipped.append({"trigger_id": tid, "gate": "suppression", "reason": f"suppression_key {sup_key!r} already sent or in flight"})
             continue
 
         # Gate 4 — active conversation
+        if SUPPRESSION.merchant_reserved(merchant_id):
+            skipped.append({
+                "trigger_id": tid, "gate": "active_conversation",
+                "reason": "merchant has an in-flight compose reservation",
+            })
+            continue
         open_convs = CONVERSATIONS.open_conversations_for_merchant(merchant_id)
         if open_convs:
             skipped.append({
@@ -339,11 +388,8 @@ def _gate_filter(now_dt: datetime, trigger_ids: list[str]) -> tuple[list[dict[st
             consent_scope = (customer.get("consent") or {}).get("scope") or []
             kind = trigger.get("kind", "")
             # Soft check: pass if either scope-list is empty (no granular consent recorded)
-            # or contains a matching consent. Accept any of these naming conventions:
-            consent_aliases = {kind, kind + "s", "all", "appointment_reminders" if "appointment" in kind else "",
-                               "recall_reminders" if "recall" in kind else "",
-                               "promotional_offers" if kind in {"festival_upcoming", "winback_eligible"} else ""}
-            consent_aliases.discard("")
+            # or contains a matching consent.
+            consent_aliases = _consent_aliases_for(kind)
             if consent_scope and not (consent_aliases & set(consent_scope)):
                 skipped.append({
                     "trigger_id": tid, "gate": "customer_consent",
@@ -383,6 +429,33 @@ def _select_top_actions(survivors: list[dict[str, Any]]) -> list[dict[str, Any]]
     return top
 
 
+async def _reserve_selected_items(selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reserve selected trigger/merchant pairs before LLM work starts.
+
+    The gate filter is intentionally read-only; this reservation step is the
+    atomic seam that prevents overlapping ticks from emitting the same trigger
+    while a compose call is still in flight.
+    """
+    reserved: list[dict[str, Any]] = []
+    for item in selected:
+        trigger = item["trigger"]
+        merchant = item["merchant"]
+        merchant_id = merchant.get("merchant_id", "")
+        suppression_key = trigger.get("suppression_key", "")
+        ok = await SUPPRESSION.reserve_for_compose(suppression_key, merchant_id)
+        if not ok:
+            log_event(
+                "tick_skip",
+                trigger_id=trigger.get("id"),
+                gate_failed="reservation",
+                reason="suppression key or merchant already sent/in flight",
+            )
+            continue
+        item["reserved_suppression_key"] = suppression_key
+        reserved.append(item)
+    return reserved
+
+
 async def _compose_with_action_state(item: dict[str, Any]) -> tuple[dict[str, Any] | None, "bot.ComposedMessage | None"]:
     """Run compose for one survivor and shape into a /v1/tick action dict.
 
@@ -394,8 +467,8 @@ async def _compose_with_action_state(item: dict[str, Any]) -> tuple[dict[str, An
     category = item["category"]
     customer = item["customer"]
 
-    composed = await bot.compose(category, merchant, trigger, customer,
-                                 test_id=trigger.get("id"))
+    composed = await bot.acompose(category, merchant, trigger, customer,
+                                  test_id=trigger.get("id"))
 
     # Composer self-veto
     if composed.is_skip():
@@ -424,9 +497,12 @@ async def _emit_action_state_updates(action: dict[str, Any], composed: "bot.Comp
     merchant = item["merchant"]
     customer = item["customer"]
 
-    sup_key = trigger.get("suppression_key", "")
-    if sup_key:
-        await SUPPRESSION.record_emit(sup_key, merchant.get("merchant_id"), now_ts)
+    await SUPPRESSION.commit_emit(
+        item.get("reserved_suppression_key", trigger.get("suppression_key", "")),
+        composed.suppression_key or action.get("suppression_key", ""),
+        merchant.get("merchant_id"),
+        now_ts,
+    )
 
     conv_id = action["conversation_id"]
     new_state = ConversationState(
@@ -438,8 +514,8 @@ async def _emit_action_state_updates(action: dict[str, Any], composed: "bot.Comp
         phase=ConvPhase.INITIATED,
         last_send_ts=now_ts,
         turns=[{"from": "bot", "body": composed.body, "ts": now_ts,
-                "hash": hashlib.sha256(composed.body.encode("utf-8")).hexdigest(), "label": "initial"}],
-        prior_bot_hashes={hashlib.sha256(composed.body.encode("utf-8")).hexdigest()},
+                "hash": _hash_body_norm(composed.body), "label": "initial"}],
+        prior_bot_hashes={_hash_body_norm(composed.body)},
     )
     await CONVERSATIONS.upsert(new_state)
 
@@ -469,34 +545,59 @@ async def tick(req: TickRequest) -> dict[str, Any]:
 
     # 2. Select top-3 (1/merchant, urgency-sorted, then category-sorted)
     selected = _select_top_actions(survivors)
+    selected = await _reserve_selected_items(selected)
+    if not selected:
+        log_event("tick_complete", actions=0, attempted=len(req.available_triggers),
+                  skipped=len(skipped), selected=0)
+        return {"actions": []}
 
     # 3. Parallel compose with hard 23s cutoff
-    coros = [_compose_with_action_state(item) for item in selected]
     actions: list[dict[str, Any]] = []
-    completed_count = 0
+    task_items = [
+        (asyncio.create_task(_compose_with_action_state(item)), item)
+        for item in selected
+    ]
+    tasks = {task: item for task, item in task_items}
+    done, pending = await asyncio.wait(tasks.keys(), timeout=TICK_TIMEOUT_S)
 
-    try:
-        gathered = await asyncio.wait_for(
-            asyncio.gather(*coros, return_exceptions=True),
-            timeout=TICK_TIMEOUT_S,
+    if pending:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in pending:
+            item = tasks[task]
+            await SUPPRESSION.release_reservation(
+                item.get("reserved_suppression_key", item["trigger"].get("suppression_key", "")),
+                item["merchant"].get("merchant_id"),
+            )
+        log_event(
+            "tick_timeout",
+            attempted_count=len(selected),
+            completed_count=len(done),
+            cutoff_seconds=TICK_TIMEOUT_S,
         )
-        for item, result in zip(selected, gathered):
-            if isinstance(result, Exception):
-                log_event("compose_call_failed", trigger_id=item["trigger"].get("id"),
-                          error=str(result), error_type=type(result).__name__)
-                continue
-            action, composed = result
-            completed_count += 1
-            if action is None or composed is None:
-                continue
-            await _emit_action_state_updates(action, composed, item, now_ts)
-            actions.append(action)
-    except asyncio.TimeoutError:
-        log_event("tick_timeout", attempted_count=len(selected), completed_count=completed_count,
-                  cutoff_seconds=TICK_TIMEOUT_S)
-        # Return whatever finished (none, since gather is all-or-nothing on timeout).
-        # In the future we could swap to per-task timeouts to salvage partials.
-        return {"actions": []}
+
+    for task, item in task_items:
+        if task not in done:
+            continue
+        try:
+            action, composed = task.result()
+        except Exception as exc:
+            await SUPPRESSION.release_reservation(
+                item.get("reserved_suppression_key", item["trigger"].get("suppression_key", "")),
+                item["merchant"].get("merchant_id"),
+            )
+            log_event("compose_call_failed", trigger_id=item["trigger"].get("id"),
+                      error=str(exc), error_type=type(exc).__name__)
+            continue
+        if action is None or composed is None:
+            await SUPPRESSION.release_reservation(
+                item.get("reserved_suppression_key", item["trigger"].get("suppression_key", "")),
+                item["merchant"].get("merchant_id"),
+            )
+            continue
+        await _emit_action_state_updates(action, composed, item, now_ts)
+        actions.append(action)
 
     log_event("tick_complete", actions=len(actions),
               attempted=len(req.available_triggers),
@@ -567,11 +668,11 @@ async def reply(req: ReplyRequest) -> dict[str, Any]:
 
     category, merchant, trigger, customer = _resolve_reply_contexts(conv_state, req)
 
-    # Append the incoming merchant/customer turn to history BEFORE classify
-    # (so verbatim-dup detection on prior turns picks up real history).
+    # Build the incoming turn. It is appended after classification so the
+    # duplicate auto-reply check compares only against prior merchant turns.
     incoming_turn = {
         "from": req.from_role, "body": req.message, "ts": time.time(),
-        "hash": hashlib.sha256(req.message.encode("utf-8")).hexdigest(),
+        "hash": _hash_body_norm(req.message),
         "label": "incoming",
     }
 
@@ -607,7 +708,7 @@ async def reply(req: ReplyRequest) -> dict[str, Any]:
 
     # Append outgoing bot turn (if we sent something) + update prior_bot_hashes
     if action_obj.action == "send" and action_obj.body:
-        body_hash = hashlib.sha256(action_obj.body.encode("utf-8")).hexdigest()
+        body_hash = _hash_body_norm(action_obj.body)
         conv_state.turns.append({
             "from": "bot", "body": action_obj.body, "ts": time.time(),
             "hash": body_hash, "label": action_obj.label,
@@ -615,7 +716,7 @@ async def reply(req: ReplyRequest) -> dict[str, Any]:
         conv_state.prior_bot_hashes.add(body_hash)
     elif action_obj.action == "end" and action_obj.body:
         # Off-spec deliberate (hostile branch returns body alongside end)
-        body_hash = hashlib.sha256(action_obj.body.encode("utf-8")).hexdigest()
+        body_hash = _hash_body_norm(action_obj.body)
         conv_state.turns.append({
             "from": "bot", "body": action_obj.body, "ts": time.time(),
             "hash": body_hash, "label": action_obj.label,

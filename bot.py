@@ -1,18 +1,24 @@
 """Pure composer + reply handler. No HTTP, no globals (beyond imports), no I/O.
 
 Public surface (stable; called by server.py and make_submission.py):
-    compose(category, merchant, trigger, customer=None, *, conversation_history=None)
+    compose(category, merchant, trigger, customer=None) -> dict
+        Sync challenge-contract wrapper. Returns public dict keys only.
+    acompose(category, merchant, trigger, customer=None, *, conversation_history=None)
         -> ComposedMessage
     classify_reply(message, conv_history) -> ReplyLabel    [S14]
     handle_reply(conv_state, message)     -> ReplyAction   [S15-S16]
 
-This module is async-friendly. compose() awaits llm_client.compose_call.
+This module is async-friendly internally. `acompose()` awaits llm_client.compose_call;
+`compose()` is deliberately synchronous for challenge-brief.md §7.1.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -33,6 +39,8 @@ from prompts.templates import (
 )
 import classifiers
 import validator
+
+COMPOSE_CONTRACT_TIMEOUT_S = float(os.getenv("COMPOSE_CONTRACT_TIMEOUT_S", "28.0"))
 
 # ---- types -----------------------------------------------------------------
 
@@ -84,7 +92,70 @@ class ComposedMessage:
 # ---- compose ---------------------------------------------------------------
 
 
-async def compose(
+def compose(
+    category: dict[str, Any],
+    merchant: dict[str, Any],
+    trigger: dict[str, Any],
+    customer: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Synchronous challenge-contract entrypoint.
+
+    challenge-brief.md §7.1 expects `def compose(...) -> dict` with exactly the
+    public submission keys. The server and scripts use `acompose()` so they can
+    stay async and retain private validation telemetry.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_compose_public_with_contract_timeout(category, merchant, trigger, customer))
+
+    # Some harnesses run user code from an async process. Keep the public
+    # contract synchronous by doing the async work in a short-lived thread.
+    result: dict[str, Any] | None = None
+    error: BaseException | None = None
+
+    def _runner() -> None:
+        nonlocal result, error
+        try:
+            result = asyncio.run(_compose_public_with_contract_timeout(category, merchant, trigger, customer))
+        except BaseException as exc:  # propagate exactly after join
+            error = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+    if error is not None:
+        raise error
+    assert result is not None
+    return result
+
+
+async def _compose_public_with_contract_timeout(
+    category: dict[str, Any],
+    merchant: dict[str, Any],
+    trigger: dict[str, Any],
+    customer: dict[str, Any] | None,
+) -> dict[str, Any]:
+    try:
+        composed = await asyncio.wait_for(
+            acompose(category, merchant, trigger, customer),
+            timeout=COMPOSE_CONTRACT_TIMEOUT_S,
+        )
+        return composed.public()
+    except asyncio.TimeoutError:
+        log_event(
+            "compose_contract_timeout",
+            merchant_id=merchant.get("merchant_id"),
+            trigger_id=trigger.get("id"),
+            cutoff_seconds=COMPOSE_CONTRACT_TIMEOUT_S,
+        )
+        fb = validator.fallback(trigger, merchant, customer)
+        fb.fallback_used = True
+        fb.prompt_version = PROMPT_VERSION
+        return fb.public()
+
+
+async def acompose(
     category: dict[str, Any],
     merchant: dict[str, Any],
     trigger: dict[str, Any],
@@ -615,7 +686,7 @@ async def handle_reply(
     else:
         playbook_override = None  # "engaged" → use default per-kind playbook
 
-    composed = await compose(
+    composed = await acompose(
         category, merchant, trigger, customer,
         conversation_history=conv_history,
         playbook_override=playbook_override,
@@ -642,4 +713,4 @@ async def handle_reply(
 
 # Re-exported so other modules can compute the same hash key for anti-repetition
 def hash_body(body: str) -> str:
-    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return validator._hash_body_norm(body)
