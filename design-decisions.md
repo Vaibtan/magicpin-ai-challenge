@@ -1,8 +1,10 @@
 # Vera Bot — Design Decisions
 
-**Last updated**: 2026-04-30
+**Last updated**: 2026-05-03
 **Status**: Locked. Implementation reference + source-of-truth for the submission README.
 **Scope**: All architectural and policy choices for the magicpin AI Challenge — Vera bot.
+
+**Final state**: Live judge `full_evaluation` averages **43/50 (86%)**; 10-pair holdout averages **41.2/50** (gap ~4%, no overfit). Prompt locked at `v8`. Active LLM provider: Gemini (`gemini-3-flash-preview` compose / `gemini-3.1-flash-lite-preview` classify). The Anthropic Sonnet + OpenAI gpt-4o paths are preserved and selectable via `LLM_PROVIDER` / `LLM_FALLBACK_PROVIDER` env vars; the LLM stack table below stays the documented design even though the runtime currently runs Gemini, because none of the architectural choices around prompt structure, validator rules, or composition shape change with the model swap.
 
 > Each section is keyed to the interview question (Q1-Q12) where the choice was made. "Why" lines capture the reason, so future-us (or a reviewer) can judge edge cases without re-litigating.
 
@@ -19,15 +21,16 @@
 
 ## 2. LLM stack (Q2)
 
-| Role | Model | Mode |
-|---|---|---|
-| Composer | Anthropic `claude-sonnet-4-6` | `temperature=0`, JSON output |
-| Side-tasks (auto-reply detect, language detect, intent classify, hostile detect) | Anthropic `claude-haiku-4-5-20251001` | `temperature=0`, JSON output |
-| Fallback (Anthropic outage / rate limit) | OpenAI `gpt-4o` | `temperature=0`, JSON mode |
+The `llm_client` module is provider-agnostic at runtime. `LLM_PROVIDER` (default `anthropic`) selects the primary; `LLM_FALLBACK_PROVIDER` (default `openai`, can be `none`) selects the fallback. Each provider has its own compose-model + classify-model pair, and the response-cache key embeds the model name so providers never collide.
 
-- Optimization target: **best-score-per-dollar**, not pure quality and not pure cost.
+| Role | Anthropic | OpenAI | Gemini |
+|---|---|---|---|
+| Composer | `claude-sonnet-4-6` (2 ephemeral cache breakpoints) | `gpt-4o` | `gemini-2.5-pro` (or `-3-flash-preview`) |
+| Side-tasks (auto-reply / language / intent / hostile fallback) | `claude-haiku-4-5-20251001` | `gpt-4o-mini` | `gemini-2.5-flash` (or `-3.1-flash-lite-preview`) |
 
-**Why**: Sonnet 4.6 is the cost/quality sweet spot for nuanced voice + Hindi-English code-mix. Haiku 4.5 handles the high-volume cheap-classification path (auto-reply, language) at ~10× lower cost than running Sonnet there. Single fallback hop (OpenAI) keeps reliability without a multi-provider mesh.
+All calls use `temperature=0` + JSON output. Optimization target: **best-score-per-dollar**, not pure quality and not pure cost.
+
+**Why**: Sonnet 4.6 is the cost/quality sweet spot for nuanced voice + Hindi-English code-mix. Haiku 4.5 handles the high-volume cheap-classification path at ~10× lower cost than running Sonnet there. Single fallback hop (OpenAI gpt-4o) keeps reliability without a multi-provider mesh. Gemini was added as a selectable third option when Anthropic credit ran out; the architecture (validator rules, prompt skeletons, playbook map) is model-agnostic — only `_gemini_compose` adds two model-specific guards: `thinking_config(thinking_budget=0)` to disable Gemini-3's silent CoT, and a 12000-token `max_output_tokens` ceiling to absorb thinking overhead even if the budget hint is partially ignored on preview models. Truncation diagnostics surface `finish_reason` + `thoughts_token_count` in error logs.
 
 ---
 
@@ -215,15 +218,39 @@ prompts/
                    # (auto_reply probe/exit, hostile, not_interested, defer, unclear).
                    # 16+ trigger-kind templates × 2 languages (en + hi-en).
 scripts/
-  smoke_llm.py             # Single Sonnet + Haiku live call (S03/S04 verify).
+  smoke_llm.py             # Single compose + classify live call against the
+                           # active provider chain (--openai-only, --gemini-only flags).
   smoke_integration.py     # Full E2E via FastAPI TestClient (passes w/o keys).
   compose_one.py           # Drive bot.acompose() on one test pair (S06 eyeball).
   test_validator.py        # 10/10 deterministic validator unit tests.
   test_classifiers.py      # 30/30 reply-classifier regex tests.
-  run_judge.py             # Wrapper over judge_simulator.py: loads .env, defaults
-                           # to Anthropic Sonnet, monkey-patches _warmup to push
-                           # all customers + merchants + triggers (closes the
-                           # simulator's customer-context gap).
+  test_state_policy.py     # State-store invariants + tick gate behaviors.
+  test_tick_reservations.py # Concurrency: overlapping ticks can't double-emit.
+  run_judge.py             # Wrapper over judge_simulator.py: loads .env, applies
+                           # the overrides below, monkey-patches _warmup to push
+                           # all categories + merchants + customers + triggers
+                           # (closes the simulator's customer-context gap).
+  judge_provider_overrides.py  # Self-contained patches the wrapper applies to
+                           # the bundled judge_simulator without editing it:
+                           # (a) PatchedGeminiProvider — the stock REST adapter
+                           #     allocates only 1500 output tokens, which Gemini
+                           #     2.5/3 burn on hidden CoT, returning a response
+                           #     with no `parts` field → KeyError. The patched
+                           #     adapter raises the budget, sets JSON mime, and
+                           #     surfaces real errors with finishReason + usage.
+                           # (b) _patch_full_context_scorer — the bundled per-
+                           #     call scoring prompt only shows a narrow context
+                           #     summary; this expands it to the full category/
+                           #     merchant/trigger/customer JSON + bot rationale,
+                           #     which matches what the actual challenge judge
+                           #     gets per challenge-brief.md §16. The judge's
+                           #     SYSTEM rubric (dimension definitions, 0-10
+                           #     scale, "Be STRICT", penalty rules) is preserved
+                           #     untouched.
+                           # (c) configure_judge_from_env / configure_utf8_stdio
+                           #     — env-driven provider selection (anthropic /
+                           #     openai / gemini / deepseek / groq / openrouter)
+                           #     and Windows-console UTF-8 reconfiguration.
 Dockerfile         # Production container — non-root user, healthcheck wired.
 .dockerignore      # Excludes .venv, .cache, logs, secrets.
 fly.toml           # Backup deploy: fly.io Mumbai region, always-warm machine.
@@ -303,7 +330,13 @@ Runs after every compose (and reply) call:
 - **Optional** for strained kinds: `festival, weather_heatwave, dormant_with_vera, scheduled_recurring`. Validator branches on `trigger.kind`.
 - Stripped before returning to the judge — internal validation artifact only.
 
-**Why**: Judge has explicit -2 penalty per fabrication. One hallucinated citation costs more than the entire validator's compute. Single retry is cheap (one extra Sonnet call max) and only fires on actual failures, not every compose. Fallback prevents catastrophic empty-body returns.
+### Numeric-anchor equivalence (added v6)
+
+- The validator's substring check rejected anchors that were mathematically equivalent but formatted differently (e.g. anchor `-50%` against context `delta_pct: -0.5`). This forced legitimate, factually-correct messages into the deterministic fallback path.
+- `_numeric_anchor_equivalent_in_context()` is a fallback check that runs only when the substring check fails: it parses the anchor as a number (with optional `%` suffix and sign), generates equivalent candidates (`-50%` ↔ `-0.5`), walks the contexts collecting all numeric values, and passes if any context number ~= any candidate.
+- This is **not** widening the fabrication net: the bot's body still has to make factual sense; the judge still scores Specificity / Merchant-Fit independently. The change just stops the validator from rejecting natural human formatting of values that are present in the contexts.
+
+**Why**: Judge has explicit -2 penalty per fabrication. One hallucinated citation costs more than the entire validator's compute. Single retry is cheap and only fires on actual failures, not every compose. Fallback prevents catastrophic empty-body returns. Numeric equivalence prevents the validator from being stricter than the judge itself, since a reasonable human judge (and the patched LLM judge) recognizes `30%` and `0.30` as the same fact.
 
 ---
 
@@ -448,23 +481,44 @@ Workflows powered by these logs:
 ### Self-grading
 
 - `scripts/run_judge.py` is the wrapper around stock `judge_simulator.py`. It
-  loads `.env`, defaults to Anthropic Sonnet for the judge LLM role, and
-  monkey-patches `_warmup` to push **all** customers + merchants + triggers
+  loads `.env`, applies `scripts/judge_provider_overrides.py`, and monkey-patches
+  `_warmup` to push **all** categories + merchants + customers + triggers
   (the stock harness only pushes 5 merchants and zero customers, which would
   tank our 5 customer-scope test pairs). Always invoke via the wrapper, never
   edit `judge_simulator.py` directly.
-- Run `_full` scenario after each major prompt change: scores all 30 pairs.
-- **Target**: ≥ 40/50 average on 30-pair set before submitting.
+- The overrides also fix two non-scoring bugs in the bundled simulator: a
+  too-small Gemini output budget that caused empty-text responses, and a per-
+  call scoring prompt that omitted the full contexts + bot rationale that the
+  real challenge judge sees per `challenge-brief.md §16`. The judge's SYSTEM
+  rubric (dimension definitions, 0-10 scale, penalty rules) stays untouched.
+- Run `_full` scenario after each major prompt change: scores up to 10 actions
+  per evaluation across 10 merchants × 25 triggers.
+- **Target**: ≥ 40/50 average on the live judge before submitting. **Achieved: 43/50.**
 - Holdout (10-pair) run **once** post-lockdown to verify no overfit, scored
   via `python make_submission.py --holdout --score` which reuses the same
-  `LLMScorer` from `judge_simulator.py`.
+  `LLMScorer` from `judge_simulator.py`. **Achieved: 41.2/50** — gap to live
+  test-pair score is ~4%, well inside the 10% no-overfit threshold.
+
+### Offline scoring fix (S19)
+
+- `_score_results` originally used the bundled `DatasetLoader` to look up
+  contexts by id. That loader reads `merchants_seed.json` etc., which contain
+  only a subset of merchants/triggers/customers. Holdout pairs reference ids
+  outside that subset, so every context resolved to `{}` and the judge scored
+  against empty data (Merchant Fit collapsed to 0 across all 10 pairs in
+  the first holdout run). Fixed by routing offline scoring through the same
+  per-file resolver (`_resolve_pair_inputs`) the composer already uses.
 
 ### Stopping rule
 
-- **Cap step 8 at 6 self-grading runs.**
-- If <40/50 by then, lock and ship anyway. Diminishing returns + judge-side LLM stochasticity dominates small prompt deltas past that point.
+- **Cap S18 at 6 self-grading runs.** Hit the target on the 6th iteration
+  (v6 → 43/50). v7 + v8 were architectural cleanups (removing the borderline
+  `_polish_customer_lapsed_hard` post-compose override, adding the snake_case
+  leak rule), not score chasing.
+- If <40/50 by run 6, lock and ship anyway. Diminishing returns + judge-side
+  LLM stochasticity dominates small prompt deltas past that point.
 
-**Why**: Without a stopping rule, prompt iteration is a tar pit. 6 runs × ~30 messages each = ~180 LLM-judge calls of grading budget — affordable and bounded.
+**Why**: Without a stopping rule, prompt iteration is a tar pit. 6 runs × ~10 messages each = ~60 LLM-judge calls of grading budget — affordable and bounded.
 
 ---
 

@@ -10,6 +10,12 @@ import json
 import sys
 from pathlib import Path
 
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bot import ComposedMessage  # noqa: E402
@@ -41,6 +47,7 @@ MERCHANT = {
     "category_slug": "dentists",
     "identity": {"name": "Dr. Meera's Dental Clinic", "owner_first_name": "Meera",
                  "languages": ["en", "hi"], "city": "Delhi", "locality": "Lajpat Nagar"},
+    "performance": {"delta_7d": {"calls_pct": -0.5}},
 }
 
 TRIGGER_RESEARCH = {
@@ -102,18 +109,27 @@ def main() -> int:
                       trigger=TRIGGER_RESEARCH, customer=None, anchor_required=True)
     expect("anchor fabricated", errors, should_fail=True, contains="anchor_fabricated")
 
-    # 3. Anchor missing when mandatory
+    # 3. Numeric anchor equivalence — body may say -50% while context stores -0.5
+    composed = _ok(
+        body="Dr. Meera, calls dipped 50% this week. Want me to audit what changed?",
+        anchor="-50.0%",
+    )
+    errors = validate(composed, category=DENTIST_CATEGORY, merchant=MERCHANT,
+                      trigger=TRIGGER_RESEARCH, customer=None, anchor_required=True)
+    expect("numeric anchor equivalent", errors, should_fail=False)
+
+    # 4. Anchor missing when mandatory
     composed = _ok(body="Dr. Meera, quick check-in. Anything I can help with?", anchor="")
     errors = validate(composed, category=DENTIST_CATEGORY, merchant=MERCHANT,
                       trigger=TRIGGER_RESEARCH, customer=None, anchor_required=True)
     expect("anchor missing (mandatory)", errors, should_fail=True, contains="anchor: missing")
 
-    # 4. Anchor missing when optional → pass
+    # 5. Anchor missing when optional → pass
     errors = validate(composed, category=DENTIST_CATEGORY, merchant=MERCHANT,
                       trigger=TRIGGER_RESEARCH, customer=None, anchor_required=False)
     expect("anchor missing (optional kind)", errors, should_fail=False)
 
-    # 5. Vocab taboo
+    # 6. Vocab taboo
     composed = _ok(
         body="Dr. Meera, our guaranteed approach gives the best results. Want the abstract?",
         anchor="JIDA Oct 2026, p.14",
@@ -122,13 +138,13 @@ def main() -> int:
                       trigger=TRIGGER_RESEARCH, customer=None, anchor_required=True)
     expect("taboo word used", errors, should_fail=True, contains="taboo_used")
 
-    # 6. Body too short
+    # 7. Body too short
     composed = _ok(body="Hi", anchor="JIDA Oct 2026, p.14")
     errors = validate(composed, category=DENTIST_CATEGORY, merchant=MERCHANT,
                       trigger=TRIGGER_RESEARCH, customer=None, anchor_required=True)
     expect("body too short", errors, should_fail=True, contains="too short")
 
-    # 7. Invalid CTA
+    # 8. Invalid CTA
     composed = _ok(
         body="Dr. Meera, this week's JIDA Oct 2026, p.14 dropped. Want the abstract?",
         anchor="JIDA Oct 2026, p.14",
@@ -138,7 +154,7 @@ def main() -> int:
                       trigger=TRIGGER_RESEARCH, customer=None, anchor_required=True)
     expect("invalid cta", errors, should_fail=True, contains="invalid cta")
 
-    # 8. send_as integrity (customer present but send_as=vera)
+    # 9. send_as integrity (customer present but send_as=vera)
     composed = _ok(
         body="Hi Priya, your recall window opened. Reply YES to schedule.",
         anchor="JIDA Oct 2026, p.14", send_as="vera",
@@ -148,7 +164,7 @@ def main() -> int:
                       trigger=TRIGGER_RESEARCH, customer=customer, anchor_required=True)
     expect("send_as wrong for customer", errors, should_fail=True, contains="send_as:")
 
-    # 9. Skip-veto — empty body with rationale starting "skip:" → pass
+    # 10. Skip-veto — empty body with rationale starting "skip:" → pass
     composed = ComposedMessage(
         body="", cta="none", send_as="vera",
         suppression_key=TRIGGER_RESEARCH["suppression_key"],
@@ -159,7 +175,7 @@ def main() -> int:
                       trigger=TRIGGER_RESEARCH, customer=None, anchor_required=True)
     expect("skip-veto recognized", errors, should_fail=False)
 
-    # 10. Anti-repetition (with prior_bot_hashes)
+    # 11. Anti-repetition (with prior_bot_hashes)
     composed = _ok(
         body="Dr. Meera, this week's JIDA Oct 2026, p.14 dropped — 2100-patient trial. Want the abstract?",
         anchor="JIDA Oct 2026, p.14",

@@ -29,6 +29,13 @@ sys.path.insert(0, str(ROOT))
 
 from bot import acompose  # noqa: E402
 from obs import log_event  # noqa: E402
+from scripts.judge_provider_overrides import (  # noqa: E402
+    configure_judge_from_env,
+    configure_utf8_stdio,
+    patch_judge_simulator,
+)
+
+configure_utf8_stdio()
 
 
 DATASET = ROOT / "dataset"
@@ -110,14 +117,15 @@ async def main() -> int:
 
     start = time.monotonic()
 
-    # Sequential to maximize prompt-cache hits in category-sorted order.
-    # (Parallel composes within a category would race the cache write.)
+    # Sequential to maximize prompt-cache and response-cache locality.
     results: list[dict[str, Any]] = []
+    had_errors = False
     for i, pair in enumerate(pairs, 1):
         t0 = time.monotonic()
         try:
             res = await _process_one(pair)
         except Exception as exc:
+            had_errors = True
             print(f"  [ERROR] {pair['test_id']}: {exc}")
             log_event("make_submission_error", test_id=pair["test_id"], error=str(exc),
                       error_type=type(exc).__name__)
@@ -149,6 +157,10 @@ async def main() -> int:
     avg_chars = sum(len(r["composed"].body) for r in results) / max(1, len(results))
     print(f"  fallbacks: {n_fb}  skips: {n_skip}  cache_hits: {n_cache}  avg_body_chars: {avg_chars:.0f}")
 
+    if had_errors or len(results) != len(pairs):
+        print(f"  ERROR: composed {len(results)}/{len(pairs)} pairs; output file is incomplete.")
+        return 1
+
     if args.score:
         return await _score_results(results, holdout=args.holdout)
 
@@ -164,51 +176,45 @@ async def _score_results(results: list[dict[str, Any]], *, holdout: bool) -> int
     print()
     print("Scoring composed outputs via LLM judge…")
 
-    # Re-use judge_simulator's scorer + provider creation
-    sys.path.insert(0, str(ROOT / "scripts"))
+    # Re-use judge_simulator's scorer + provider creation.
     # Load env config (so judge knows which provider to use)
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
-    import os
     import judge_simulator as js
 
-    provider = os.getenv("JUDGE_LLM_PROVIDER", "anthropic")
-    js.LLM_PROVIDER = provider
-    if provider == "anthropic":
-        js.LLM_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-        js.LLM_MODEL = os.getenv("JUDGE_LLM_MODEL", "claude-sonnet-4-6")
-    elif provider == "openai":
-        js.LLM_API_KEY = os.getenv("OPENAI_API_KEY", "")
-        js.LLM_MODEL = os.getenv("JUDGE_LLM_MODEL", "gpt-4o")
-    else:
-        js.LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+    patch_judge_simulator(js)
+    configure_judge_from_env(js, default_gemini_model="gemini-2.5-flash")
 
     if not js.LLM_API_KEY:
-        print(f"  [SKIP] No API key for provider {provider!r}; cannot score offline.")
+        print(f"  [SKIP] No API key for provider {js.LLM_PROVIDER!r}; cannot score offline.")
         return 0
 
     llm = js.create_provider()
+    # NOTE on context loading: judge_simulator's bundled DatasetLoader reads
+    # *_seed.json files which contain only a subset of merchants/triggers/
+    # customers. For test/holdout pairs whose ids are outside that subset,
+    # `dataset.merchants.get(...)` returns `{}` and the judge scores against
+    # empty contexts (Merchant Fit and Specificity collapse to ~0). We bypass
+    # the seed files and load the full per-file JSONs directly via the same
+    # resolver the composer uses, so every pair scores against its real
+    # contexts regardless of seed membership.
     dataset = js.DatasetLoader(DATASET)
-    if not dataset.load():
-        print("  [ERROR] dataset load failed")
-        return 1
+    dataset.load()  # populate categories (per-file glob); seed gaps don't matter below
     scorer = js.LLMScorer(llm, dataset)
 
     totals: list[int] = []
     for res in results:
         pair = res["pair"]
-        merchant = dataset.merchants.get(pair["merchant_id"], {})
-        trigger = dataset.triggers.get(pair["trigger_id"], {})
-        customer = dataset.customers.get(pair.get("customer_id")) if pair.get("customer_id") else None
-        category = dataset.categories.get(merchant.get("category_slug", ""), {})
+        category, merchant, trigger, customer = _resolve_pair_inputs(pair)
 
-        # Build an action-shaped dict for the scorer
+        # Build an action-shaped dict for the scorer (mirror live tick output)
         line = res["line"]
         action = {
-            "body": line["body"],
-            "cta": line["cta"],
-            "send_as": line["send_as"],
-            "rationale": line["rationale"],
+            "body": line.get("body", ""),
+            "cta": line.get("cta", "none"),
+            "send_as": line.get("send_as", "vera"),
+            "suppression_key": line.get("suppression_key", ""),
+            "rationale": line.get("rationale", ""),
         }
         score = scorer.score(action, category, merchant, trigger, customer)
         totals.append(score.total)

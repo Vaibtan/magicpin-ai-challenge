@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 _PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _SPACE_RE = re.compile(r"\s+")
+_NUMERIC_ANCHOR_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?\s*%?$")
 
 
 def _normalize(s: str) -> str:
@@ -81,6 +82,72 @@ def _stringify_context_for_anchor_search(
     if customer is not None:
         walk(customer)
     return _normalize(" ".join(bits))
+
+
+def _numeric_anchor_equivalent_in_context(
+    anchor: str,
+    category: dict[str, Any],
+    merchant: dict[str, Any],
+    trigger: dict[str, Any],
+    customer: dict[str, Any] | None,
+) -> bool:
+    """Allow harmless numeric formatting differences for private anchors.
+
+    Models often write a human percentage (`-50%`) while the source context
+    stores the raw fraction (`-0.5`). The body is allowed to humanize numbers;
+    rejecting the whole message over the private anchor format is too brittle.
+    """
+    raw = anchor.strip().replace(",", "")
+    if not _NUMERIC_ANCHOR_RE.match(raw):
+        return False
+
+    is_percent = raw.endswith("%")
+    try:
+        value = float(raw[:-1] if is_percent else raw)
+    except ValueError:
+        return False
+
+    candidates = {value}
+    if is_percent or abs(value) > 1:
+        candidates.add(value / 100.0)
+    if not is_percent and abs(value) <= 1:
+        candidates.add(value * 100.0)
+
+    numbers: list[float] = []
+
+    def walk(obj: Any) -> None:
+        if obj is None or isinstance(obj, bool):
+            return
+        if isinstance(obj, (int, float)):
+            numbers.append(float(obj))
+            return
+        if isinstance(obj, str):
+            s = obj.strip().replace(",", "")
+            if _NUMERIC_ANCHOR_RE.match(s):
+                try:
+                    numbers.append(float(s[:-1] if s.endswith("%") else s))
+                except ValueError:
+                    pass
+            return
+        if isinstance(obj, dict):
+            for v in obj.values():
+                walk(v)
+            return
+        if isinstance(obj, (list, tuple, set)):
+            for v in obj:
+                walk(v)
+
+    walk(category)
+    walk(merchant)
+    walk(trigger)
+    if customer is not None:
+        walk(customer)
+
+    for n in numbers:
+        for c in candidates:
+            if abs(n - c) <= max(1e-9, abs(n) * 1e-6):
+                return True
+    return False
 
 
 # ---- language detection (cheap heuristic) ----------------------------------
@@ -179,7 +246,11 @@ def validate(
         # full normalized anchor to appear as a substring; if the LLM cited an
         # excerpt, this catches it. We do NOT do fuzzy matching — fabrications
         # often include subtle distortions.
-        if anchor_norm and anchor_norm not in haystack:
+        if (
+            anchor_norm
+            and anchor_norm not in haystack
+            and not _numeric_anchor_equivalent_in_context(composed.anchor, category, merchant, trigger, customer)
+        ):
             errors.append(f"anchor_fabricated: {composed.anchor!r} not in contexts")
 
     # --- Rule 3: vocab taboo ---

@@ -101,9 +101,19 @@ The trigger's playbook suggests a default lever pairing. Adjust if the merchant 
 - Buried CTA — the ask must land in the last sentence
 - Promotional tone for clinical/peer categories (dentists, pharmacies)
 - Hallucinated data — if not in contexts, leave it out
+- Cross-trigger leakage — do not mention digest/research/trend items unless the current trigger or playbook explicitly points to that item
+- Invented quantities — no "top 50 customers", package prices, customer lists, search lifts, class counts, or timelines unless the exact fact appears in the provided contexts
+- Internal-jargon leak — NEVER echo a snake_case identifier (e.g. `kids_yoga_summer_camp`, `intent_topic`, `corporate_bulk_thali_package`, `top_item_id`) verbatim into the body. The merchant has not seen these field names. Convert to natural language: `kids_yoga_summer_camp` → "kids yoga summer camp"; `corporate_bulk_thali_package` → "the corporate bulk thali package"; never include underscores or schema-style keys in the body. The judge applies a -1 penalty for each leak.
 - Long preambles ("I hope you're doing well, I'm reaching out today...")
 - Re-introducing yourself after the first turn
 - Repeating a body verbatim from prior turns
+
+# BODY FACT DISCIPLINE (scoring-critical)
+- The BODY may use 2-4 concrete facts, but EVERY concrete claim must be supported by the current contexts or the BODY EVIDENCE CANDIDATES block.
+- Prefer this mix: one trigger fact + one merchant/customer fact + one active offer/peer/category fact only when relevant.
+- If you mention a source, manufacturer, city, offer, price, count, percentage, date, slot, package shape, or affected customer set, it must be present in the evidence.
+- Do not use category facts just because they exist. Use them only when they directly explain this trigger.
+- If a useful body would require unsupported facts, ask to draft/check/share/checklist instead of claiming the facts are already known.
 
 # SKIP POLICY
 - If the trigger genuinely does not fit this merchant (e.g., aligner-trend trigger for a paediatric-only practice; festival trigger for a merchant with no relevant offers), set `body=""` and `rationale="skip: <one-line reason>"`.

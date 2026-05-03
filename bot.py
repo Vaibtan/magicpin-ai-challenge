@@ -32,6 +32,7 @@ from prompts.playbooks import (
     get_playbook,
     is_anchor_mandatory,
 )
+from prompts.evidence import build_evidence_hints
 from prompts.skeletons import CUSTOMER_FACING_SYSTEM, MERCHANT_FACING_SYSTEM
 from prompts.templates import (
     auto_reply_exit, auto_reply_probe, defer_rationale,
@@ -123,7 +124,18 @@ def compose(
 
     thread = threading.Thread(target=_runner, daemon=True)
     thread.start()
-    thread.join()
+    thread.join(COMPOSE_CONTRACT_TIMEOUT_S + 2.0)
+    if thread.is_alive():
+        log_event(
+            "compose_contract_thread_timeout",
+            merchant_id=merchant.get("merchant_id"),
+            trigger_id=trigger.get("id"),
+            cutoff_seconds=COMPOSE_CONTRACT_TIMEOUT_S,
+        )
+        fb = validator.fallback(trigger, merchant, customer)
+        fb.fallback_used = True
+        fb.prompt_version = PROMPT_VERSION
+        return fb.public()
     if error is not None:
         raise error
     assert result is not None
@@ -216,6 +228,7 @@ async def acompose(
 
     for attempt in (0, 1):
         dynamic_text = _serialize_dynamic(
+            category=category,
             merchant=merchant,
             trigger=trigger,
             customer=customer,
@@ -364,6 +377,7 @@ def _serialize_category(category: dict[str, Any]) -> str:
 
 def _serialize_dynamic(
     *,
+    category: dict[str, Any],
     merchant: dict[str, Any],
     trigger: dict[str, Any],
     customer: dict[str, Any] | None,
@@ -465,6 +479,12 @@ def _serialize_dynamic(
             f"preferences: {prefs}",
             f"consent: opted_in_at={consent.get('opted_in_at')}, scope={consent.get('scope', [])}",
         ])
+
+    # ---- evidence hints ----
+    evidence = build_evidence_hints(category=category, merchant=merchant, trigger=trigger, customer=customer)
+    if evidence:
+        lines.extend(["", "[BODY EVIDENCE CANDIDATES — use these for concrete claims]"])
+        lines.extend(evidence)
 
     # ---- playbook ----
     lines.extend(["", playbook_text])

@@ -84,11 +84,11 @@ CTA: "Want a 1-line nudge?"
 
     "ipl_match_today": """
 TRIGGER: IPL match in the merchant's city tonight; footfall pattern shift.
-ANCHOR: payload.match_teams or payload.local_city; pair with the merchant's
-  active offer if it fits an IPL-night use case (dine-in delivery, pizza, etc.).
+ANCHOR: payload.match or payload.venue or payload.city; pair with the merchant's
+  active offer / delivery-share / order mix if it fits an IPL-night use case.
 LEVER: specificity + curiosity. Many merchants don't optimise for these one-offs.
-WHY-NOW: "<teams> in <city> tonight — your <category> typically sees a +X% bump."
-CTA: "Want me to push a 1-line offer to your top 50 customers?"
+WHY-NOW: "<match> at <venue> tonight — your current offer/order mix suggests a concrete next step."
+CTA: "Want me to draft a 1-line match-night combo?" Do NOT invent customer counts.
 """.strip(),
 
     "competitor_opened": """
@@ -115,7 +115,7 @@ CTA: open-ended. "Worth listing it on your profile?"
 
     "category_seasonal": """
 TRIGGER: Seasonal demand shift (start of summer, monsoon, winter).
-ANCHOR: payload.season_change + a category seasonal_beat from contexts.
+ANCHOR: payload.season or one payload.trends[] item + a category seasonal_beat from contexts.
 LEVER: loss_aversion + reciprocity. Heads-up to capture the predictable shift.
 WHY-NOW: "<season> shift just started — historically your <category> sees X."
 CTA: "Want a 1-line note on what to stock up?"
@@ -172,6 +172,7 @@ ANCHOR: payload.days_remaining + payload.renewal_amount + ONE concrete value
 LEVER: loss_aversion + specificity. Quantified value > vague "renew now".
 WHY-NOW: "Your renewal is in <X> days. Last <window> you got <metric>."
 CTA: "Want me to walk through what's queued for next month?"
+DO NOT mention unrelated category digest/research/trend items in a renewal message.
 """.strip(),
 
     "review_theme_emerged": """
@@ -206,24 +207,27 @@ CTA: open-ended question. NO binary CTA on this kind.
     "active_planning_intent": """
 TRIGGER: Merchant has an active planning thread (corporate orders, kids program,
   new launch). Continue the planning conversation.
-ANCHOR: payload thread topic + recent conversation_history exchanges.
+ANCHOR: payload.intent_topic + recent conversation_history exchanges.
 LEVER: effort_externalization + asking. Move the plan one step forward.
 WHY-NOW: "Picking up on the <topic> thread — the next step is X."
 CTA: "Want me to draft <next deliverable>?"
+If prior conversation already contains package details, reuse those exact details.
+Do NOT invent new pricing, class counts, customer cohorts, or package terms.
 """.strip(),
 
     "supply_alert": """
 TRIGGER: Supply / SKU recall, shortage, or restock event for the category.
-ANCHOR: payload.sku / payload.alert_subject + the source. Verbatim.
+ANCHOR: payload.molecule + payload.affected_batches[] + payload.manufacturer.
+  If payload.alert_id resolves to a digest item, use that source/title too.
 LEVER: loss_aversion + reciprocity. Time-sensitive operational signal.
-WHY-NOW: "Heads-up: <subject> alert just came in. Affects <SKU/category>."
+WHY-NOW: "Heads-up: <molecule> alert just came in. Affects <batch codes>."
 CTA: "Want the alternates list?" / "Want the SKU codes?"
 """.strip(),
 
     "winback_eligible": """
 TRIGGER: Merchant has dropped subscription / engagement; eligible for a winback.
-ANCHOR: payload.days_inactive + ONE quantified historic value (peak views, peak
-  leads, total customers acquired).
+ANCHOR: payload.days_since_expiry + payload.perf_dip_pct + ONE quantified
+  merchant/customer value (views, calls, total customers, lapsed customers).
 LEVER: loss_aversion + reciprocity. Concrete historic value > vague "come back".
 WHY-NOW: "While you were off, your category in <city> moved <X>. Plus, you have
   <historic_value> already. Worth 5 mins to re-activate?"
@@ -240,8 +244,8 @@ CTA: "Want the registration link?" / "Should I block your calendar?"
 
     "gbp_unverified": """
 TRIGGER: Google Business Profile is unverified — capping the merchant's reach.
-ANCHOR: merchant.identity.verified=false + a quantified upside (e.g.,
-  peer_stats showing what verified merchants earn).
+ANCHOR: merchant.identity.verified=false + payload.estimated_uplift_pct +
+  the merchant's current performance/views/calls.
 LEVER: loss_aversion + effort_externalization. "5 minutes; unlocks X."
 WHY-NOW: "Your profile is unverified. Verifying takes ~5 min and lifts X by Y%."
 CTA: "Want me to walk you through?"
@@ -283,13 +287,33 @@ CTA: open or binary. Honor preferred_slots if known.
 """.strip(),
 
     "customer_lapsed_hard": """
-TRIGGER (CUSTOMER): Customer is 'lapsed_hard' (6mo+ since last visit, near churn).
-ANCHOR: customer.relationship.lifetime_value + last_service. Concrete value framing.
-LEVER: reciprocity + loss_aversion. Last attempt before churn — be human, not transactional.
+TRIGGER (CUSTOMER): Customer is 'lapsed_hard' (long inactive, near churn).
+ANCHOR: payload.days_since_last_visit (literal number). The concrete days count
+  is the strongest specificity hook — keep it as the raw number from the payload.
+LEVER: reciprocity + binary_commitment. Make returning frictionless, NOT guilt-laden.
 SEND_AS: merchant_on_behalf.
-WHY-NOW: "Hi <name>, just wanted to reach out — it's been a while since your
-  last <service>. <merchant> has changed in N ways since then."
-CTA: low-friction. "Want to drop by for a free 5-min look?" — avoid sales.
+
+REQUIRED FACTS (use what's available; do not invent):
+  1. customer.identity.name
+  2. merchant.identity.name (so the customer knows who's writing)
+  3. payload.days_since_last_visit (the anchor — raw integer from payload)
+  4. payload.previous_focus OR customer.preferences.training_focus (one phrase, if either is present)
+  5. ONE active merchant offer title (merchant.offers[i].title where status=="active"), if any active offer exists
+  6. customer.preferences.preferred_slots (one short slot phrase, if present and natural to inline)
+
+TONE: warm, factual, no shame. AVOID "we miss you", "where have you been",
+  "it's been forever", or any guilt-tripping. State facts; offer a path back.
+
+LENGTH: under 240 characters. Short and concrete beats long and apologetic.
+
+CTA: ONE binary commitment in the last sentence — e.g. "Reply YES and we'll
+  hold one for you." Avoid open-ended asks; lapsed customers convert better
+  on a single low-friction confirmation.
+
+WHY-NOW SHAPE: "Hi <name>, <merchant> here. It's been <days> days since your
+  last visit. For your <focus> goal, we can restart with <offer><optional slot>.
+  Reply YES and we'll hold one for you."
+  (Adapt naturally — do NOT verbatim-copy this line; it's the target shape.)
 """.strip(),
 
     "appointment_tomorrow": """

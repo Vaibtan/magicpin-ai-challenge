@@ -42,6 +42,7 @@ import asyncio
 import hashlib
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,12 +66,17 @@ GEMINI_COMPOSE_MODEL = os.getenv("GEMINI_COMPOSE_MODEL") or "gemini-2.5-pro"
 GEMINI_CLASSIFY_MODEL = os.getenv("GEMINI_CLASSIFY_MODEL") or "gemini-2.5-flash"
 
 # Keep one primary call plus one fallback inside the tick envelope.
-LLM_CALL_TIMEOUT_S = float(os.getenv("LLM_CALL_TIMEOUT_S", "10.0"))
-# Gemini 3 family does silent "thinking" by default and consumes output tokens
-# even when we ask for short JSON. We disable thinking via ThinkingConfig and
-# also keep a generous output budget as a safety net against truncation.
-COMPOSE_MAX_TOKENS = int(os.getenv("COMPOSE_MAX_TOKENS", "4000"))
-CLASSIFY_MAX_TOKENS = int(os.getenv("CLASSIFY_MAX_TOKENS", "800"))
+# Bumped from 10s → 14s: concurrent tick calls (3-way asyncio.gather) get
+# queued by Gemini's free-tier preview quotas. 14s gives slack while staying
+# under the simulator's 15s tick deadline.
+LLM_CALL_TIMEOUT_S = float(os.getenv("LLM_CALL_TIMEOUT_S", "14.0"))
+# Gemini 3 preview family does silent "thinking" by default and may ignore
+# thinking_budget=0 — the hidden CoT then consumes most of max_output_tokens,
+# truncating the visible JSON. 12000 absorbs that overhead so even a verbose
+# Hinglish reply has room. Cost stays low (we set thinking_budget=0; only the
+# unused-but-allocated ceiling rises).
+COMPOSE_MAX_TOKENS = int(os.getenv("COMPOSE_MAX_TOKENS", "12000"))
+CLASSIFY_MAX_TOKENS = int(os.getenv("CLASSIFY_MAX_TOKENS", "2000"))
 
 CACHE_DIR = ROOT / ".cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -83,15 +89,16 @@ RESPONSE_CACHE_FILE = CACHE_DIR / "llm_responses.jsonl"
 class ResponseCache:
     """Append-only JSONL cache; full-input-hash key. Lazy-loaded on first hit.
 
-    Append-only is intentional: cache writes during a tick are non-blocking
-    (no rewrite of prior lines), and the file is greppable post-run.
+    Append-only is intentional: cache writes avoid rewriting prior lines, and
+    the file is greppable post-run. A threading lock is used because the public
+    sync compose() wrapper may run this client from short-lived event loops.
     """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self._mem: dict[str, dict[str, Any]] = {}
         self._loaded = False
-        self._lock = asyncio.Lock()
+        self._lock = threading.RLock()
 
     def _load_sync(self) -> None:
         if self._loaded:
@@ -111,11 +118,12 @@ class ResponseCache:
                     continue
 
     async def get(self, key: str) -> dict[str, Any] | None:
-        self._load_sync()
-        return self._mem.get(key)
+        with self._lock:
+            self._load_sync()
+            return self._mem.get(key)
 
     async def put(self, key: str, response: dict[str, Any]) -> None:
-        async with self._lock:
+        with self._lock:
             self._load_sync()
             self._mem[key] = response
             line = json.dumps({"key": key, "response": response}, ensure_ascii=False) + "\n"
@@ -460,8 +468,18 @@ async def _gemini_compose(skeleton: str, category: str, dynamic: str) -> dict[st
     if not text:
         # Some safety blocks return empty .text — surface as error so chain falls through.
         raise RuntimeError(f"gemini returned empty text (finish_reason={_gemini_finish_reason(resp)})")
-    parsed = _extract_json(text)
     cached, total, out = _gemini_usage(resp)
+    thoughts = _gemini_thoughts(resp)
+    finish = _gemini_finish_reason(resp)
+    try:
+        parsed = _extract_json(text)
+    except ValueError as exc:
+        # Surface why the JSON didn't parse — almost always max_tokens truncation
+        # caused by hidden thinking tokens. Caller logs this through obs.log_event.
+        raise RuntimeError(
+            f"gemini truncated/invalid JSON: finish={finish} "
+            f"prompt_tok={total} thoughts_tok={thoughts} output_tok={out}: {exc}"
+        ) from exc
     return {
         "json": parsed,
         "model": GEMINI_COMPOSE_MODEL,
@@ -480,6 +498,15 @@ def _gemini_usage(resp: Any) -> tuple[int, int, int]:
     total = getattr(usage, "prompt_token_count", 0) or 0
     out = getattr(usage, "candidates_token_count", 0) or 0
     return cached, total, out
+
+
+def _gemini_thoughts(resp: Any) -> int:
+    """Hidden-thinking token count, if Gemini reports it. Useful for diagnosing
+    JSON truncation under preview models that ignore thinking_budget=0."""
+    usage = getattr(resp, "usage_metadata", None)
+    if usage is None:
+        return 0
+    return getattr(usage, "thoughts_token_count", 0) or 0
 
 
 def _gemini_finish_reason(resp: Any) -> str:

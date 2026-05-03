@@ -10,12 +10,9 @@ Why a wrapper, not edits to judge_simulator.py:
     tank, and the simulator never tests our customer-facing skeleton.
 
 What this wrapper does:
-  1. Loads .env (so ANTHROPIC_API_KEY / OPENAI_API_KEY work without hardcoding).
-  2. Configures judge_simulator's module-level constants:
-       LLM_PROVIDER ← env (default 'anthropic')
-       LLM_API_KEY  ← env (ANTHROPIC_API_KEY or OPENAI_API_KEY by provider)
-       LLM_MODEL    ← env (default 'claude-sonnet-4-6')
-       BOT_URL      ← env (default 'http://localhost:8080')
+  1. Loads .env so provider keys work without hardcoding.
+  2. Configures judge_simulator's module-level provider/model/BOT_URL constants
+     from JUDGE_LLM_PROVIDER, JUDGE_LLM_MODEL, and provider API key env vars.
   3. Monkey-patches JudgeSimulator._warmup to also push ALL customer contexts.
   4. Delegates to judge_simulator.main() for the requested scenario.
 
@@ -35,6 +32,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from scripts.judge_provider_overrides import (  # noqa: E402
+    configure_judge_from_env,
+    configure_utf8_stdio,
+    patch_judge_simulator,
+)
+
+configure_utf8_stdio()
+
 # Load .env BEFORE importing judge_simulator (its config is module-scope)
 from dotenv import load_dotenv  # noqa: E402
 
@@ -43,29 +48,8 @@ load_dotenv(ROOT / ".env")
 import judge_simulator as js  # noqa: E402
 
 
-# ---- 1. Override config from env --------------------------------------------
-
-PROVIDER = os.getenv("JUDGE_LLM_PROVIDER", "anthropic")
-js.LLM_PROVIDER = PROVIDER
-
-if PROVIDER == "anthropic":
-    js.LLM_API_KEY = os.getenv("ANTHROPIC_API_KEY", "") or js.LLM_API_KEY
-    js.LLM_MODEL = os.getenv("JUDGE_LLM_MODEL", "claude-sonnet-4-6") or js.LLM_MODEL
-elif PROVIDER == "openai":
-    js.LLM_API_KEY = os.getenv("OPENAI_API_KEY", "") or js.LLM_API_KEY
-    js.LLM_MODEL = os.getenv("JUDGE_LLM_MODEL", "gpt-4o") or js.LLM_MODEL
-elif PROVIDER == "gemini":
-    js.LLM_API_KEY = os.getenv("GEMINI_API_KEY", "") or js.LLM_API_KEY
-    js.LLM_MODEL = os.getenv("JUDGE_LLM_MODEL", "gemini-2.5-pro") or js.LLM_MODEL
-elif PROVIDER == "deepseek":
-    js.LLM_API_KEY = os.getenv("DEEPSEEK_API_KEY", "") or js.LLM_API_KEY
-elif PROVIDER == "groq":
-    js.LLM_API_KEY = os.getenv("GROQ_API_KEY", "") or js.LLM_API_KEY
-elif PROVIDER == "openrouter":
-    js.LLM_API_KEY = os.getenv("OPENROUTER_API_KEY", "") or js.LLM_API_KEY
-# ollama needs no key
-
-js.BOT_URL = os.getenv("BOT_URL", js.BOT_URL)
+patch_judge_simulator(js)
+configure_judge_from_env(js, default_gemini_model="gemini-2.5-pro")
 
 # Pick scenario from positional arg (preferred) or env (fallback)
 if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
@@ -86,8 +70,19 @@ def _patched_warmup(self) -> bool:
     if not _orig_warmup(self):
         return False
 
-    # Push ALL merchants too (stock pushes only first 5 → most pairs unresolvable)
     js.print_section("FULL MERCHANT + CUSTOMER PUSH (run_judge.py patch)")
+
+    # Re-push ALL categories too. The stock warmup already does this, but local
+    # uvicorn --reload can restart between warmup and this patch while editing
+    # files, wiping in-memory contexts.
+    cat_pushed = 0
+    for slug, cat in self.dataset.categories.items():
+        data, err, _ = self.client.push_context("category", slug, 1, cat)
+        if data and data.get("accepted"):
+            cat_pushed += 1
+    js.print_success(f"categories pushed: {cat_pushed}/{len(self.dataset.categories)}")
+
+    # Push ALL merchants too (stock pushes only first 5 → most pairs unresolvable)
     m_pushed = 0
     for mid, m in self.dataset.merchants.items():
         data, err, _ = self.client.push_context("merchant", mid, 1, m)

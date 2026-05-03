@@ -5,4 +5,4 @@ on every compose. Bumping it invalidates the response cache for affected
 entries (cache key includes prompt_version). Bump on any prompt change.
 """
 
-PROMPT_VERSION = "v5"
+PROMPT_VERSION = "v8"
