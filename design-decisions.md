@@ -40,17 +40,25 @@ All calls use `temperature=0` + JSON output. Optimization target: **best-score-p
 - **Two skeleton system prompts**, picked by whether `customer` is `None`:
   - `MERCHANT_FACING_SYSTEM` (Vera's voice → merchant)
   - `CUSTOMER_FACING_SYSTEM` (merchant's voice → customer, drafted by Vera)
-- **Playbook map** keyed on `trigger.kind`. ~14 entries:
-  - External: `research_digest`, `regulation_change`, `festival`, `weather_heatwave`, `local_news_event`, `competitor_opened`, `category_trend_movement`
-  - Internal: `perf_spike`, `perf_dip`, `milestone_reached`, `dormant_with_vera`, `renewal_due`, `review_theme_emerged`, `scheduled_recurring`
-  - Customer-scope: `recall_due`, `customer_lapsed_soft`, `customer_lapsed_hard`, `appointment_tomorrow`, `unplanned_slot_open`
-  - Reply-handling: `ACTION_MODE`, `QA_MODE`
+- **Playbook map** keyed on `trigger.kind`. **31 entries total** — the documented baseline kinds plus extras to cover the full generated dataset:
+  - External: `research_digest`, `regulation_change`, `festival_upcoming`, `weather_heatwave`, `local_news_event`, `competitor_opened`, `category_trend_movement`, `ipl_match_today`, `cde_opportunity`
+  - Internal: `perf_spike`, `perf_dip`, `seasonal_perf_dip`, `milestone_reached`, `dormant_with_vera`, `renewal_due`, `review_theme_emerged`, `scheduled_recurring`, `gbp_unverified`, `winback_eligible`, `category_seasonal`, `supply_alert`, `active_planning_intent`, `curious_ask_due`
+  - Customer-scope: `recall_due`, `customer_lapsed_soft`, `customer_lapsed_hard`, `appointment_tomorrow`, `unplanned_slot_open`, `chronic_refill_due`, `trial_followup`, `wedding_package_followup`
+  - Reply-handling: `ACTION_MODE_PLAYBOOK`, `QA_MODE_PLAYBOOK`
 - Each playbook is a 3-5 line framing snippet (which compulsion lever, which payload field is the anchor) injected next to the dynamic context, not a separate prompt.
 - **Output is structured JSON**: `body, cta, suppression_key, send_as, rationale, anchor (private), lever (private)`.
 - `rationale` doubles as chain-of-thought — judge reads it (free CoT), so model is told to think aloud there.
 - Validator runs after compose; one re-prompt on hard fail; deterministic safe fallback if both fail.
 
-**Why**: A single well-prompted Sonnet call with explicit structure beats a two-stage pipeline on cost (1 call instead of 2) without losing meaningful quality once `rationale` is doing CoT duty. Per-kind playbooks keep specificity high without splitting the prompt machinery.
+### Evidence-hint block (added during prompt-tuning S18)
+
+`bot._build_evidence_hints()` injects a curated fact menu into the dynamic prompt block — every line draws *only* from real context fields (merchant identity / performance / offers / review themes / payload / resolved digest items / customer relationship / category peer benchmarks). The block is structural data plumbing, not synthesis: the same facts were already in the raw serialized contexts; this just surfaces them legibly so the model is less likely to gap-fill with plausible business facts. Reduced fabrication-class validator failures meaningfully on perf and supply-alert kinds.
+
+### Customer-lapsed-hard playbook discipline (post-tuning architectural decision)
+
+An earlier iteration had a `_polish_customer_lapsed_hard()` post-compose body override in `bot.py` that replaced the LLM's output with a deterministic template (using only real context fields) for that one trigger kind. It scored well but was architecturally awkward: a reviewer reading `bot.py` linearly would see a single hardcoded template for one judged trigger and reasonably ask why the LLM composer exists for that case. Removed in v7. The same shape constraints (≤240 chars, single binary CTA, no-shame tone, required-fact priority order) now live in the playbook itself as guidance to the composer. Authorship stays with the LLM; the validator remains the only post-compose gate. Score impact: ~0.5 average points across a 10-message eval, traded for code-review credibility and architectural coherence.
+
+**Why**: A single well-prompted Sonnet call with explicit structure beats a two-stage pipeline on cost (1 call instead of 2) without losing meaningful quality once `rationale` is doing CoT duty. Per-kind playbooks keep specificity high without splitting the prompt machinery. Evidence hints + playbook-shape constraints (rather than post-compose overrides) preserve the "single composer is the author" principle that makes the whole pipeline auditable.
 
 ---
 
@@ -163,7 +171,7 @@ Per `available_trigger`:
 ### Hard timeout safety net
 
 - The parallel compose tasks are wrapped in an `asyncio.wait(..., timeout=23.0)` ceiling.
-- 23s is the safety margin under the spec's 30s and the simulator's actual 15s budget for `/v1/tick`. Two layers of buffer: per-call LLM ceiling at 10s (in `llm_client.LLM_CALL_TIMEOUT_S`) and the tick task wrapper at 23s. This leaves enough time for one provider fallback before the tick ceiling. Both env-overridable via `TICK_TIMEOUT_S` and `LLM_CALL_TIMEOUT_S`.
+- 23s is the safety margin under the spec's 30s and the simulator's actual 15s budget for `/v1/tick`. Two layers of buffer: per-call LLM ceiling at 14s (in `llm_client.LLM_CALL_TIMEOUT_S`, raised from 10s after observing Gemini free-tier preview-quota throttling under the 3-way concurrent gather pattern) and the tick task wrapper at 23s. This leaves room for one provider fallback before the tick ceiling. Both env-overridable via `TICK_TIMEOUT_S` and `LLM_CALL_TIMEOUT_S`.
 - On timeout: cancel pending tasks, release their reservations, emit `event=tick_timeout` with `{completed_count, attempted_count}`, and return any completed valid actions. Never block past 23s.
 - `/v1/reply` gets the same wrapper — if classify+compose+validate exceeds 23s, return `action: "end"` with rationale `"timeout_safe_exit"` rather than blocking past spec.
 

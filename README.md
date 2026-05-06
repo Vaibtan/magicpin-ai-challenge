@@ -4,13 +4,19 @@ A merchant + customer-on-behalf AI assistant on WhatsApp. One composition engine
 
 **Self-graded score:** 43/50 (86%) on the live judge `full_evaluation` scenario; 41.2/50 on the 10-pair holdout (no overfit).
 
-## Approach
+## Solution Architecture
 
-One composition engine powers both deliverables: a synchronous `bot.compose(...) -> dict` for the static submission contract and an async `acompose()` path used by the FastAPI bot and batch generator. The live bot exposes the five required `/v1/*` endpoints and stores pushed category, merchant, customer, and trigger contexts in memory with versioned idempotency.
+![Vera Bot architecture](./architecture.png)
 
-The composer uses two skeleton prompts (merchant-facing and customer-facing) plus a 31-entry per-`trigger.kind` playbook map. A 6-rule deterministic validator checks structure, send-as integrity, taboo vocabulary, verifiable anchors (with numeric-equivalence tolerance for `-50%` ↔ `-0.5`), language fit, and anti-repetition. One retry on validation failure; deterministic safe fallback on second failure. Reply handling uses regex prefilters for auto-replies, hostile, not-interested, action intent, and defer requests, with a small classifier fallback only for unclear cases.
+The system is one composition engine wrapped by two presentations — a synchronous `compose()` for the static `submission.jsonl` and an async `acompose()` for the live HTTPS bot. Reading the diagram top-to-bottom:
 
-The tick loop uses a seven-gate policy: resolution, stale, suppression, active conversation, cooldown (urgency≥4 bypasses), daily cap, and customer consent. Surviving triggers are capped to one per merchant and three per tick, sorted by `(urgency desc, expires asc)`, and composed in parallel with a 23s wrapper timeout. The LLM provider is selectable at runtime — Anthropic Sonnet, OpenAI gpt-4o, or Gemini — via `LLM_PROVIDER` / `LLM_FALLBACK_PROVIDER` env vars, and the response cache key embeds the model name so providers never collide.
+**Client → API.** The judge talks to three meaningful endpoints: a context push (idempotent upserts of categories / merchants / customers / triggers, versioned 200/409), a tick poll (proactive sends), and a reply webhook (reactive sends). Two utility endpoints (healthz, metadata) and an optional teardown round out the surface.
+
+**Engine — two paths converge on one composer.** The proactive path runs incoming triggers through a 7-gate filter (resolution, staleness, suppression, active-conversation, cooldown with urgency≥4 bypass, daily cap, customer consent), then a selection step that caps emissions to 1/merchant and 3/tick and reserves keys before composing. The reactive path classifies the merchant's reply (regex prefilters first, classifier fallback only when prefilters disagree) and routes through a 9-row branch table into a 5-state conversation FSM. Both paths feed into the same composer, which picks one of two skeleton prompts (merchant-facing or customer-facing) and a 31-entry playbook keyed on `trigger.kind`.
+
+**Composition pipeline.** The composer hands a structured prompt to the LLM provider chain (Anthropic Sonnet → OpenAI gpt-4o → Gemini, all selectable at runtime), then runs the JSON output through a 6-rule deterministic validator: structural shape, anchor verifiability with numeric-equivalence tolerance (`-50%` ↔ `-0.5`), vocab taboo, language fit, anti-repetition, and send-as integrity. On pass the action goes out. On fail the validator's error list is fed back as a single retry; a second failure produces a deterministic per-kind safe fallback rather than an empty body.
+
+**State, cache, observability.** State is in-memory (judge runs start clean per spec): a Context store for pushed contexts, a Conversation store driving the reply FSM with `phase_transition` events, and a Suppression store holding sent-keys plus in-flight reservations that prevent double-emit under overlapping ticks. The cache layer is two-tier — Anthropic prompt-cache (two ephemeral breakpoints on the stable skeleton + category blocks, ~90% read-discount within 5-min TTL) and a local response-cache keyed on prompt-version + model + context hashes for byte-identical reruns. Every significant event (compose, tick_skip, validator_fail, fallback_used, cache_hit, phase_transition) lands in `logs/run_{RUN_ID}.jsonl` for post-run forensics.
 
 ## Tradeoffs
 
